@@ -7,6 +7,7 @@
 #include <vnx/NoSuchService.hxx>
 #include <vnx/Proxy.h>
 #include <vnx/ProxyInterfaceClient.hxx>
+#include <vnx/ProxyInterface_on_remote_connect.hxx>
 #include <vnx/Exception.hxx>
 #include <vnx/Sample.hxx>
 #include <mmx/NodeClient.hxx>
@@ -58,12 +59,46 @@ int proxy_peer(const char* address) {
     ::alarm(0);return 0;
 }
 
+// Each socket gets fresh VNX schema state, including after a reconnect.
+void serve_session(int socket, uint64_t process_id, size_t calls, uint32_t height) {
+    timeval timeout = {}; timeout.tv_sec = 5;
+    ::setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    vnx::SocketInputStream input_stream(socket);
+    vnx::SocketOutputStream output_stream(socket);
+    vnx::TypeInput input(&input_stream); vnx::TypeOutput output(&output_stream);
+    for(size_t i = 0; i < calls; ++i) {
+        std::shared_ptr<vnx::Request> request;
+        while(true) {
+            request = std::dynamic_pointer_cast<vnx::Request>(vnx::read(input));
+            if(!request) continue;
+            if(std::dynamic_pointer_cast<const vnx::ProxyInterface_on_remote_connect>(request->method)) {
+                auto greeting = vnx::Request::create();
+                greeting->flags = 4;
+                greeting->src_mac = vnx::Hash64(process_id);
+                greeting->dst_mac = vnx::Hash64("vnx.remote");
+                auto method = vnx::ProxyInterface_on_remote_connect::create();
+                method->process_id = vnx::Hash64(process_id);
+                greeting->method = method;
+                vnx::write(output, greeting); output.flush();
+            }
+            if(std::dynamic_pointer_cast<const mmx::Node_get_height>(request->method)) break;
+        }
+        auto response = vnx::Return::create();
+        response->request_id = request->request_id; response->src_mac = request->src_mac;
+        auto value = mmx::Node_get_height_return::create(); value->_ret_0 = height + i;
+        response->value = value; vnx::write(output, response); output.flush();
+    }
+}
+
 int main(int argc, char** argv) {
     if(argc < 2) return 1;
     if(std::string(argv[1])=="proxy" && argc==3){return proxy_peer(argv[2]);}
-    const bool server = std::string(argv[1]) == "server";
+    const bool reconnect = std::string(argv[1]) == "reconnect";
+    const bool server = reconnect || std::string(argv[1]) == "server";
     int socket = -1;
     if(server) {
+        ::alarm(15);
         const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in addr = {}; addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -72,7 +107,21 @@ int main(int argc, char** argv) {
         if(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &size)) return 3;
         if(::listen(listener, 1)) return 4;
         std::cout << "tcp://127.0.0.1:" << ntohs(addr.sin_port) << std::endl;
-        socket = ::accept(listener, nullptr, nullptr); ::close(listener);
+        for(size_t i = 0; i < (reconnect ? 3u : 1u); ++i) {
+            socket = ::accept(listener, nullptr, nullptr);
+            if(socket < 0) return 5;
+            serve_session(socket, 5051000 + i, reconnect ? 1 : 2, 5050001 + i);
+            // Deliver the final Return before disconnecting, even if the peer
+            // has an outgoing heartbeat queued. Closing unread TCP input could
+            // otherwise reset the connection and discard that response.
+            ::shutdown(socket, SHUT_WR);
+            char discard[1024];
+            while(::recv(socket, discard, sizeof(discard), 0) > 0) {}
+            ::close(socket);
+        }
+        ::close(listener);
+        ::alarm(0);
+        return 0;
     } else {
         if(argc != 3) return 1;
         std::string address = argv[2];
@@ -86,17 +135,7 @@ int main(int argc, char** argv) {
     vnx::SocketInputStream input_stream(socket);
     vnx::SocketOutputStream output_stream(socket);
     vnx::TypeInput input(&input_stream); vnx::TypeOutput output(&output_stream);
-    if(server) {
-        for(size_t i = 0; i < 2; ++i) {
-            std::shared_ptr<vnx::Request> request;
-            while(true){request=std::dynamic_pointer_cast<vnx::Request>(vnx::read(input));if(request && std::dynamic_pointer_cast<const mmx::Node_get_height>(request->method)){break;}}
-
-            auto response = vnx::Return::create();
-            response->request_id = request->request_id; response->src_mac = request->src_mac;
-            auto value = mmx::Node_get_height_return::create(); value->_ret_0 = 5050001 + i;
-            response->value = value; vnx::write(output, response); output.flush();
-        }
-    } else {
+    {
         for(size_t i = 0; i < 2; ++i) {
             auto request = vnx::Request::create(); request->request_id = i + 1;
             request->src_mac = vnx::Hash64(0x1234567890ULL); request->dst_mac = vnx::Hash64("Node");

@@ -787,6 +787,7 @@ impl Write for Stream {
 /// Only named services in this allow-list are exported. Wire session IDs are
 /// deliberately ignored: the session is assigned by the accepting application.
 pub type SessionValidator = Arc<dyn Fn(u64) -> Result<Option<Session>> + Send + Sync>;
+pub type SessionReleaser = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
 pub type Authenticator = Arc<dyn Fn(&str, &str) -> Result<Session> + Send + Sync>;
 #[derive(Clone)]
 pub struct ServerOptions {
@@ -804,6 +805,7 @@ pub struct ServerOptions {
     /// Accepts the native Proxy on_login SHA256(password), never a wire session ID.
     pub authenticator: Option<Authenticator>,
     pub session_validator: Option<SessionValidator>,
+    pub session_releaser: Option<SessionReleaser>,
 }
 impl Default for ServerOptions {
     fn default() -> Self {
@@ -818,6 +820,7 @@ impl Default for ServerOptions {
             export_topics: BTreeSet::new(),
             authenticator: None,
             session_validator: None,
+            session_releaser: None,
         }
     }
 }
@@ -989,7 +992,10 @@ fn refresh_session(session: &Arc<RwLock<Session>>, validator: &Option<SessionVal
                 .and_then(std::result::Result::ok)
                 .flatten()
                 .unwrap_or_else(Session::anonymous);
-            *session.write().unwrap() = next;
+            let mut current = session.write().unwrap();
+            if current.id == id {
+                *current = next;
+            }
         }
     }
 }
@@ -1068,6 +1074,27 @@ fn proxy_request(source: u64, id: u64, method: &str, args: Value) -> Value {
     method_value.insert("__type".into(), method.into());
     json!({"__type":"vnx.Request","stream":0,"flags":4,"hop_count":0,"src_mac":source,"dst_mac":crate::hash::hash64("vnx.remote"),"session":0,"request_id":id,"method":method_value})
 }
+struct SessionLease {
+    id: Option<u64>,
+    default_id: u64,
+    release: Option<SessionReleaser>,
+}
+impl SessionLease {
+    fn release(&mut self) {
+        if let Some(id) = self.id.take() {
+            if id != 0 && id != self.default_id {
+                if let Some(release) = &self.release {
+                    let _ = catch_unwind(AssertUnwindSafe(|| release(id)));
+                }
+            }
+        }
+    }
+}
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 fn serve_connection(
     stream: Stream,
     runtime: Runtime,
@@ -1078,6 +1105,11 @@ fn serve_connection(
     let mut input = crate::binary::Reader::new(stream.try_clone()?, registry.clone());
     let writer = Arc::new(Mutex::new(crate::binary::Writer::new(stream, registry)));
     let session = Arc::new(RwLock::new(options.session.clone()));
+    let mut session_lease = SessionLease {
+        id: None,
+        default_id: options.session.id,
+        release: options.session_releaser.clone(),
+    };
     let mut exports: BTreeMap<String, Export> = BTreeMap::new();
     let mut greeted = false;
     let mut _heartbeats: Option<Heartbeats> = None;
@@ -1145,6 +1177,7 @@ fn serve_connection(
                             let password = request["method"]["password"]
                                 .as_str()
                                 .ok_or_else(|| invalid("missing password hash"))?;
+                            session_lease.release();
                             let authenticated = match &options.authenticator {
                                 Some(authenticate) => catch_unwind(AssertUnwindSafe(|| {
                                     authenticate(username, password)
@@ -1154,6 +1187,7 @@ fn serve_connection(
                                 .unwrap_or_else(|| options.session.clone()),
                                 None => options.session.clone(),
                             };
+                            session_lease.id = Some(authenticated.id);
                             *session.write().unwrap() = authenticated.clone();
                             login_reply = Some(proxy_request(
                                 destination,
@@ -1344,217 +1378,906 @@ fn response_value(value: Value, registry: &Registry) -> Result<Value> {
     }
     Ok(value)
 }
+
+/// Established connections retry with bounded exponential backoff. Initial
+/// connect remains fail-fast. Zero heartbeat_timeout disables the inactivity
+/// watchdog; zero heartbeat_interval disables outbound heartbeats.
+#[derive(Clone, Debug)]
+pub struct ClientOptions {
+    pub reconnect: bool,
+    pub reconnect_initial_delay: Duration,
+    pub reconnect_max_delay: Duration,
+    pub connect_timeout: Duration,
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+}
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            reconnect: true,
+            reconnect_initial_delay: Duration::from_millis(100),
+            reconnect_max_delay: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(1),
+            heartbeat_interval: Duration::from_secs(10),
+            heartbeat_timeout: Duration::from_secs(30),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionStatus {
+    Disconnected,
+    Recovering,
+    Ready,
+    Closed,
+}
 struct SampleReceiver {
     topic: String,
     pipe: crate::runtime::Pipe<crate::runtime::Sample>,
     missed: Arc<AtomicU64>,
     replay: bool,
+    active: bool,
+    sequences: BTreeMap<(u64, String), u64>,
+}
+struct Credentials {
+    username: String,
+    password_hash: String,
+}
+const SAMPLE_CACHE_BYTES: usize = 16 * 1024 * 1024;
+#[derive(Default)]
+struct SampleCache {
+    values: BTreeMap<(u64, String), (crate::runtime::Sample, usize)>,
+    bytes: usize,
+}
+fn value_memory(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 32,
+        Value::String(s) => 32usize.saturating_add(s.len()),
+        Value::Array(a) => a
+            .iter()
+            .fold(32usize, |n, v| n.saturating_add(value_memory(v))),
+        Value::Object(o) => o.iter().fold(32usize, |n, (k, v)| {
+            n.saturating_add(k.len())
+                .saturating_add(64)
+                .saturating_add(value_memory(v))
+        }),
+    }
+}
+impl SampleCache {
+    fn remember(&mut self, sample: &crate::runtime::Sample) {
+        let key = (sample.src_mac, sample.topic.clone());
+        if let Some((_, bytes)) = self.values.remove(&key) {
+            self.bytes -= bytes;
+        }
+        let bytes = value_memory(&sample.value)
+            .saturating_add(sample.topic.len())
+            .saturating_add(128);
+        if bytes > SAMPLE_CACHE_BYTES {
+            return;
+        }
+        while self.bytes.saturating_add(bytes) > SAMPLE_CACHE_BYTES || self.values.len() >= 256 {
+            if let Some((_, (_, bytes))) = self.values.pop_first() {
+                self.bytes -= bytes;
+            } else {
+                break;
+            }
+        }
+        self.bytes += bytes;
+        self.values.insert(key, (sample.clone(), bytes));
+    }
+}
+struct Connection {
+    generation: u64,
+    writer: Mutex<crate::binary::Writer<Stream>>,
+    closer: Stream,
+    activity: Arc<Mutex<Instant>>,
+    cache: Mutex<SampleCache>,
+}
+struct ActivityReader {
+    stream: Stream,
+    activity: Arc<Mutex<Instant>>,
+}
+impl Read for ActivityReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.stream.read(buf)?;
+        if count > 0 {
+            *self.activity.lock().unwrap() = Instant::now();
+        }
+        Ok(count)
+    }
+}
+struct ClientState {
+    status: ConnectionStatus,
+    generation: u64,
+    connection: Option<Arc<Connection>>,
+    process_id: Option<u64>,
+    session: Option<Session>,
+}
+struct Pending {
+    generation: u64,
+    pipe: crate::runtime::Pipe<Result<Value>>,
 }
 struct NetworkInner {
-    writer: Mutex<crate::binary::Writer<Stream>>,
-    pending: Mutex<BTreeMap<u64, crate::runtime::Pipe<Result<Value>>>>,
-    closed: AtomicBool,
+    state: Mutex<ClientState>,
+    changed: Condvar,
+    pending: Mutex<BTreeMap<u64, Pending>>,
     samples: Mutex<BTreeMap<u64, SampleReceiver>>,
-    remote_session: Mutex<Option<Session>>,
-    session_changed: Condvar,
+    subscription_lock: Mutex<()>,
     login_lock: Mutex<()>,
-    remote_process_id: Mutex<Option<u64>>,
-    connection_changed: Condvar,
-    heartbeats: Mutex<Option<Heartbeats>>,
+    credentials: Mutex<Option<Credentials>>,
     next_id: AtomicU64,
     source: u64,
     service: u64,
     timeout: Duration,
-    closer: Stream,
-    reader: Mutex<Option<JoinHandle<()>>>,
+    options: ClientOptions,
+    supervisor: Mutex<Option<JoinHandle<()>>>,
+}
+// std::Mutex has no timed lock. A short bounded wait avoids blocking a
+// request beyond its deadline behind another writer or authentication exchange.
+fn lock_before<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<std::sync::MutexGuard<'_, T>> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::Timeout);
+        }
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(invalid("poisoned network mutex"))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                thread::sleep(left.min(Duration::from_millis(1)))
+            }
+        }
+    }
 }
 impl NetworkInner {
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        self.closer.shutdown();
-        self.session_changed.notify_all();
-        *self.remote_process_id.lock().unwrap() = None;
-        self.connection_changed.notify_all();
-        self.heartbeats.lock().unwrap().take();
+        let connection = {
+            let mut state = self.state.lock().unwrap();
+            state.status = ConnectionStatus::Closed;
+            state.process_id = None;
+            state.session = None;
+            state.connection.take()
+        };
+        if let Some(connection) = connection {
+            connection.closer.shutdown();
+        }
+        self.changed.notify_all();
+        self.fail_pending(None);
         for receiver in std::mem::take(&mut *self.samples.lock().unwrap()).into_values() {
             receiver.pipe.close();
         }
-        for pipe in std::mem::take(&mut *self.pending.lock().unwrap()).into_values() {
-            pipe.close();
-        }
     }
-}
-impl Drop for NetworkInner {
-    fn drop(&mut self) {
-        self.close();
-        if let Some(reader) = self.reader.lock().unwrap().take() {
-            if reader.thread().id() != thread::current().id() {
-                let _ = reader.join();
+    fn fail_pending(&self, generation: Option<u64>) {
+        let mut pending = self.pending.lock().unwrap();
+        let ids: Vec<_> = pending
+            .iter()
+            .filter(|(_, p)| generation.is_none_or(|g| g == p.generation))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(pending) = pending.remove(&id) {
+                pending.pipe.close();
             }
         }
     }
-}
-/// Multiplexed native VNX client. Returning from a timeout removes the outstanding
-/// request, so a late return cannot satisfy a subsequent call.
-#[derive(Clone)]
-pub struct NetworkClient {
-    inner: Arc<NetworkInner>,
-}
-impl NetworkClient {
-    pub fn connect(
-        endpoint: &Endpoint,
-        service: &str,
-        mut registry: Registry,
-        timeout: Duration,
-    ) -> Result<Self> {
-        if timeout.is_zero() {
-            return Err(invalid("network timeout must be positive"));
+    fn disconnected(&self, generation: u64) {
+        let connection = {
+            let mut state = self.state.lock().unwrap();
+            if state.generation != generation
+                || state.status == ConnectionStatus::Closed
+                || state.connection.is_none()
+            {
+                return;
+            }
+            state.status = ConnectionStatus::Disconnected;
+            state.process_id = None;
+            state.session = None;
+            state.connection.take()
+        };
+        if let Some(connection) = connection {
+            connection.closer.shutdown();
         }
-        register_types(&mut registry)?;
-        let stream = Stream::connect(endpoint, timeout)?;
-        stream.set_write_timeout(timeout)?;
-        let closer = stream.try_clone()?;
-        let reader_stream = stream.try_clone()?;
-        let mut random = [0_u8; 8];
-        getrandom::getrandom(&mut random).map_err(|e| invalid(format!("random identity: {e}")))?;
-        let source = u64::from_le_bytes(random).max(1);
-        let inner = Arc::new(NetworkInner {
-            writer: Mutex::new(crate::binary::Writer::new(stream, registry.clone())),
-            pending: Mutex::new(BTreeMap::new()),
-            closed: AtomicBool::new(false),
-            samples: Mutex::new(BTreeMap::new()),
-            remote_session: Mutex::new(None),
-            session_changed: Condvar::new(),
-            login_lock: Mutex::new(()),
-            remote_process_id: Mutex::new(None),
-            connection_changed: Condvar::new(),
-            heartbeats: Mutex::new(None),
-            next_id: AtomicU64::new(1),
-            source,
-            service: crate::hash::hash64(service),
-            timeout,
-            closer,
-            reader: Mutex::new(None),
-        });
-        let weak = Arc::downgrade(&inner);
-        let reader = thread::Builder::new()
-            .name("vnx-network-client".into())
-            .spawn(move || {
-                let mut input = crate::binary::Reader::new(reader_stream, registry);
-                while let Ok(response) = input.read() {
-                    let Some(inner) = weak.upgrade() else {
-                        break;
-                    };
-                    if response["__type"] == "vnx.Request"
-                        && response["dst_mac"].as_u64() == Some(crate::hash::hash64("vnx.remote"))
-                    {
-                        if response["method"]["__type"] == "vnx.ProxyInterface.on_remote_connect" {
-                            if let Some(process_id) = response["method"]["process_id"].as_u64() {
-                                *inner.remote_process_id.lock().unwrap() = Some(process_id);
-                                inner.connection_changed.notify_all();
-                                let mut ticker = inner.heartbeats.lock().unwrap();
-                                if ticker.is_none() {
-                                    let weak = Arc::downgrade(&inner);
-                                    let mut seq = 0;
-                                    *ticker =
-                                        Heartbeats::spawn(Duration::from_secs(10), move || {
-                                            let inner = weak.upgrade().ok_or(Error::Closed)?;
-                                            seq += 1;
-                                            let mut writer = inner.writer.lock().unwrap();
-                                            writer.write(&heartbeat(inner.source, seq))?;
-                                            writer.flush()
-                                        })
-                                        .ok();
-                                }
-                            }
-                        }
-                        if response["method"]["__type"] == "vnx.ProxyInterface.on_remote_login" {
-                            if let Ok(session) = serde_json::from_value::<Session>(
-                                response["method"]["remote_session"].clone(),
-                            ) {
-                                *inner.remote_session.lock().unwrap() = Some(session);
-                                inner.session_changed.notify_all();
-                            }
-                        }
-                        continue;
-                    }
-                    if response["__type"] == "vnx.Sample" {
-                        if let Some(topic) = response["topic"].as_str() {
-                            let sample = crate::runtime::Sample {
-                                topic: topic.into(),
-                                value: response["value"].clone(),
-                                src_mac: response["src_mac"].as_u64().unwrap_or(0),
-                                seq_num: response["seq_num"].as_u64().unwrap_or(0),
-                                recv_time: crate::time::now_micros(),
-                                replay: response["flags"].as_u64().unwrap_or(0) & 2 != 0,
-                            };
-                            for receiver in inner.samples.lock().unwrap().values() {
-                                if (receiver.topic.is_empty()
-                                    || receiver.topic == topic
-                                    || topic
-                                        .strip_prefix(&receiver.topic)
-                                        .is_some_and(|s| s.starts_with('.')))
-                                    && (receiver.replay || !sample.replay)
-                                    && receiver.pipe.try_send(sample.clone()).is_err()
-                                {
-                                    receiver.missed.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if response["__type"] == "vnx.Return"
-                        && response["src_mac"].as_u64() == Some(inner.source)
-                    {
-                        if let Some(id) = response["request_id"].as_u64() {
-                            if let Some(pipe) = inner.pending.lock().unwrap().remove(&id) {
-                                let _ = pipe.try_send(response_value(
-                                    response["value"].clone(),
-                                    input.registry(),
-                                ));
-                                pipe.close();
-                            }
-                        }
-                    }
-                }
-                if let Some(inner) = weak.upgrade() {
-                    inner.close();
-                }
-            })?;
-        *inner.reader.lock().unwrap() = Some(reader);
-        {
-            let greeting = proxy_request(
-                inner.source,
-                inner.next_id.fetch_add(1, Ordering::Relaxed),
-                "vnx.ProxyInterface.on_remote_connect",
-                json!({"process_id":inner.source}),
-            );
-            let mut writer = inner.writer.lock().unwrap();
-            writer.write(&greeting)?;
-            writer.flush()?;
+        self.fail_pending(Some(generation));
+        self.changed.notify_all();
+        if !self.options.reconnect {
+            for receiver in self.samples.lock().unwrap().values() {
+                receiver.pipe.close();
+            }
         }
-        Ok(Self { inner })
     }
-    pub fn wait_on_connect(&self) -> Result<u64> {
-        let deadline = Instant::now() + self.inner.timeout;
-        let mut process_id = self.inner.remote_process_id.lock().unwrap();
+    fn wait_connection(
+        &self,
+        deadline: Instant,
+        recovering: bool,
+        greeting: bool,
+    ) -> Result<Arc<Connection>> {
+        let mut state = self.state.lock().unwrap();
         loop {
-            if let Some(id) = *process_id {
-                return Ok(id);
-            }
-            if self.inner.closed.load(Ordering::Acquire) {
+            if state.status == ConnectionStatus::Closed
+                || (!self.options.reconnect && state.status == ConnectionStatus::Disconnected)
+            {
                 return Err(Error::Closed);
+            }
+            if (state.status == ConnectionStatus::Ready
+                || (recovering && state.status == ConnectionStatus::Recovering))
+                && (!greeting || state.process_id.is_some())
+            {
+                if let Some(connection) = &state.connection {
+                    return Ok(connection.clone());
+                }
             }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(Error::Timeout);
             }
-            process_id = self
-                .inner
-                .connection_changed
-                .wait_timeout(process_id, left)
-                .unwrap()
-                .0;
+            state = self.changed.wait_timeout(state, left).unwrap().0;
+        }
+    }
+    fn valid(&self, connection: &Connection, recovering: bool) -> bool {
+        let state = self.state.lock().unwrap();
+        state.generation == connection.generation
+            && state.connection.is_some()
+            && (state.status == ConnectionStatus::Ready
+                || (recovering && state.status == ConnectionStatus::Recovering))
+    }
+    fn send(&self, connection: &Connection, value: &Value, recovering: bool) -> Result<()> {
+        self.send_until(connection, value, recovering, Instant::now() + self.timeout)
+    }
+    fn send_until(
+        &self,
+        connection: &Connection,
+        value: &Value,
+        recovering: bool,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut writer = lock_before(&connection.writer, deadline)?;
+        if !self.valid(connection, recovering) {
+            return Err(Error::Closed);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::Timeout);
+        }
+        connection.closer.set_write_timeout(left)?;
+        let result = writer.write(value).and_then(|_| writer.flush());
+        if result.is_err() {
+            self.disconnected(connection.generation);
+        }
+        result
+    }
+    fn request(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+        destination: u64,
+        method: &str,
+        mut args: Value,
+        deadline: Instant,
+        recovering: bool,
+    ) -> Result<RpcCall> {
+        if !args.is_object() {
+            return Err(invalid("method arguments must be an object"));
+        }
+        args.as_object_mut()
+            .unwrap()
+            .insert("__type".into(), method.into());
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            return Err(invalid("request ID exhausted"));
+        }
+        let mut writer = lock_before(&connection.writer, deadline)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Timeout);
+        }
+        connection.closer.set_write_timeout(remaining)?;
+        let (mut call, pipe) = RpcCall::pending(id, remaining)?;
+        {
+            let state = self.state.lock().unwrap();
+            if state.generation != connection.generation
+                || state.connection.is_none()
+                || !(state.status == ConnectionStatus::Ready
+                    || (recovering && state.status == ConnectionStatus::Recovering))
+            {
+                return Err(Error::Closed);
+            }
+            let mut pending = self.pending.lock().unwrap();
+            if pending.len() >= 1024 {
+                return Err(Error::Overflow);
+            }
+            pending.insert(
+                id,
+                Pending {
+                    generation: connection.generation,
+                    pipe,
+                },
+            );
+        }
+        let weak = Arc::downgrade(self);
+        call.on_cancel(move || {
+            if let Some(inner) = weak.upgrade() {
+                inner.pending.lock().unwrap().remove(&id);
+            }
+        });
+        let request = json!({"__type":"vnx.Request","stream":0,"flags":1,"hop_count":0,"src_mac":self.source,"dst_mac":destination,"session":0,"request_id":id,"method":args});
+        let result = writer.write(&request).and_then(|_| writer.flush());
+        if let Err(error) = result {
+            self.disconnected(connection.generation);
+            return Err(error);
+        }
+        Ok(call)
+    }
+    fn login_hash(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+        username: &str,
+        password_hash: &str,
+        deadline: Instant,
+    ) -> Result<Session> {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.generation != connection.generation || state.connection.is_none() {
+                return Err(Error::Closed);
+            }
+            state.session = None;
+        }
+        let result = (|| {
+            self.request(
+                connection,
+                crate::hash::hash64("vnx.remote"),
+                "vnx.ProxyInterface.on_login",
+                json!({"name":username,"password":password_hash}),
+                deadline,
+                true,
+            )?
+            .wait()?;
+            let mut state = self.state.lock().unwrap();
+            loop {
+                if state.generation != connection.generation
+                    || state.connection.is_none()
+                    || state.status == ConnectionStatus::Closed
+                {
+                    return Err(Error::Closed);
+                }
+                if let Some(session) = &state.session {
+                    if session.user != username {
+                        return Err(Error::PermissionDenied("login failed".into()));
+                    }
+                    return Ok(session.clone());
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Error::Timeout);
+                }
+                state = self.changed.wait_timeout(state, left).unwrap().0;
+            }
+        })();
+        if matches!(result, Err(Error::Timeout)) {
+            self.disconnected(connection.generation);
+        }
+        result
+    }
+}
+/// Threads only own the inner transport, never this client-owner token. The last
+/// public client clone closes it even while a reader/supervisor holds an Arc.
+struct ClientOwner {
+    inner: Arc<NetworkInner>,
+}
+impl Drop for ClientOwner {
+    fn drop(&mut self) {
+        self.inner.close();
+        // Dial/DNS can block in std. The supervisor holds no owner token and
+        // checks Closed before installing a socket, so dropping its JoinHandle
+        // keeps the caller prompt while an outstanding dial finishes safely.
+        self.inner.supervisor.lock().unwrap().take();
+    }
+}
+fn connection(
+    stream: Stream,
+    generation: u64,
+    registry: &Registry,
+    timeout: Duration,
+) -> Result<Arc<Connection>> {
+    stream.set_write_timeout(timeout)?;
+    let closer = stream.try_clone()?;
+    Ok(Arc::new(Connection {
+        generation,
+        writer: Mutex::new(crate::binary::Writer::new(stream, registry.clone())),
+        closer,
+        activity: Arc::new(Mutex::new(Instant::now())),
+        cache: Mutex::new(SampleCache::default()),
+    }))
+}
+fn start_reader(
+    inner: &Arc<NetworkInner>,
+    connection: &Arc<Connection>,
+    registry: Registry,
+) -> Result<JoinHandle<()>> {
+    let weak = Arc::downgrade(inner);
+    let connection = connection.clone();
+    let stream = connection.closer.try_clone()?;
+    Ok(thread::Builder::new()
+        .name("vnx-network-reader".into())
+        .spawn(move || {
+            let input = ActivityReader {
+                stream,
+                activity: connection.activity.clone(),
+            };
+            let mut reader = crate::binary::Reader::new(input, registry);
+
+            while let Ok(response) = reader.read() {
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                let mut state = inner.state.lock().unwrap();
+                if state.generation != connection.generation
+                    || state.connection.is_none()
+                    || state.status == ConnectionStatus::Closed
+                {
+                    break;
+                }
+                if response["__type"] == "vnx.Request"
+                    && response["dst_mac"].as_u64() == Some(crate::hash::hash64("vnx.remote"))
+                {
+                    if response["method"]["__type"] == "vnx.ProxyInterface.on_remote_connect" {
+                        if let Some(id) = response["method"]["process_id"].as_u64() {
+                            state.process_id = Some(id);
+                            inner.changed.notify_all();
+                        }
+                    }
+                    if response["method"]["__type"] == "vnx.ProxyInterface.on_remote_login" {
+                        if let Ok(session) = serde_json::from_value::<Session>(
+                            response["method"]["remote_session"].clone(),
+                        ) {
+                            state.session = Some(session);
+                            inner.changed.notify_all();
+                        }
+                    }
+                    continue;
+                }
+                if response["__type"] == "vnx.Sample" {
+                    if let Some(topic) = response["topic"].as_str() {
+                        let mut sample = crate::runtime::Sample {
+                            topic: topic.into(),
+                            value: response["value"].clone(),
+                            src_mac: response["src_mac"].as_u64().unwrap_or(0),
+                            seq_num: response["seq_num"].as_u64().unwrap_or(0),
+                            recv_time: crate::time::now_micros(),
+                            replay: response["flags"].as_u64().unwrap_or(0) & 2 != 0,
+                        };
+                        {
+                            let mut cache = connection.cache.lock().unwrap();
+                            if response["flags"].as_u64().unwrap_or(0) & 32 != 0 {
+                                if let Some((previous, _)) = cache
+                                    .values
+                                    .get(&(sample.src_mac, sample.topic.clone()))
+                                    .filter(|(previous, _)| previous.seq_num == sample.seq_num)
+                                {
+                                    sample.value = previous.value.clone();
+                                } else {
+                                    break;
+                                }
+                            }
+                            cache.remember(&sample);
+                        }
+                        for receiver in inner.samples.lock().unwrap().values_mut() {
+                            if (receiver.topic.is_empty()
+                                || receiver.topic == topic
+                                || topic
+                                    .strip_prefix(&receiver.topic)
+                                    .is_some_and(|s| s.starts_with('.')))
+                                && (receiver.replay || !sample.replay)
+                            {
+                                if sample.seq_num != 0 {
+                                    let channel = (sample.src_mac, sample.topic.clone());
+                                    if receiver
+                                        .sequences
+                                        .get(&channel)
+                                        .is_some_and(|seq| *seq == sample.seq_num)
+                                    {
+                                        continue;
+                                    }
+                                    if receiver.sequences.len() >= 4096 {
+                                        receiver.sequences.pop_first();
+                                    }
+                                    receiver.sequences.insert(channel, sample.seq_num);
+                                }
+                                if receiver.pipe.try_send(sample.clone()).is_err() {
+                                    receiver.missed.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if response["__type"] == "vnx.Return"
+                    && response["src_mac"].as_u64() == Some(inner.source)
+                {
+                    if let Some(id) = response["request_id"].as_u64() {
+                        let mut pending = inner.pending.lock().unwrap();
+                        if pending
+                            .get(&id)
+                            .is_some_and(|p| p.generation == connection.generation)
+                        {
+                            if let Some(pending) = pending.remove(&id) {
+                                let _ = pending.pipe.try_send(response_value(
+                                    response["value"].clone(),
+                                    reader.registry(),
+                                ));
+                                pending.pipe.close();
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(inner) = weak.upgrade() {
+                inner.disconnected(connection.generation);
+            }
+        })?)
+}
+fn restore(inner: &Arc<NetworkInner>, connection: &Arc<Connection>) -> Result<()> {
+    // The login mutex can be held by an explicit login waiting for the next socket;
+    // socket installation and its reader happen before trying to acquire it.
+    let _login = inner.login_lock.lock().unwrap();
+    let deadline = Instant::now() + inner.timeout;
+    let result = (|| {
+        {
+            let mut state = inner.state.lock().unwrap();
+            loop {
+                if state.generation != connection.generation
+                    || state.connection.is_none()
+                    || state.status == ConnectionStatus::Closed
+                {
+                    return Err(Error::Closed);
+                }
+                if state.process_id.is_some() {
+                    break;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Error::Timeout);
+                }
+                state = inner.changed.wait_timeout(state, left).unwrap().0;
+            }
+        }
+        {
+            let credentials = inner.credentials.lock().unwrap();
+            if let Some(credentials) = credentials.as_ref() {
+                let logged_in = inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.user == credentials.username);
+                if !logged_in {
+                    inner.login_hash(
+                        connection,
+                        &credentials.username,
+                        &credentials.password_hash,
+                        deadline,
+                    )?;
+                }
+            }
+        }
+        let _subscriptions = inner.subscription_lock.lock().unwrap();
+        let topics: BTreeSet<_> = inner
+            .samples
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.active)
+            .map(|s| s.topic.clone())
+            .collect();
+        for topic in topics {
+            inner
+                .request(
+                    connection,
+                    crate::hash::hash64("vnx.remote"),
+                    "vnx.ProxyInterface.enable_export",
+                    json!({"topic_name":topic}),
+                    deadline,
+                    true,
+                )?
+                .wait()?;
+        }
+        let mut state = inner.state.lock().unwrap();
+        if state.generation != connection.generation
+            || state.connection.is_none()
+            || state.status == ConnectionStatus::Closed
+        {
+            return Err(Error::Closed);
+        }
+        state.status = ConnectionStatus::Ready;
+        inner.changed.notify_all();
+        Ok(())
+    })();
+    if result.is_err() {
+        inner.disconnected(connection.generation);
+    }
+    result
+}
+fn supervise(
+    weak: std::sync::Weak<NetworkInner>,
+    endpoint: Endpoint,
+    registry: Registry,
+    initial: Arc<Connection>,
+    reader: JoinHandle<()>,
+) {
+    let mut connection = initial;
+    let mut reader = Some(reader);
+    let mut heartbeat_seq = 0;
+    if let Some(inner) = weak.upgrade() {
+        let _ = restore(&inner, &connection);
+    }
+
+    loop {
+        let Some(inner) = weak.upgrade() else {
+            connection.closer.shutdown();
+            break;
+        };
+        let mut next_heartbeat = Instant::now();
+        loop {
+            let mut state = inner.state.lock().unwrap();
+            if state.status == ConnectionStatus::Closed
+                || state.connection.is_none()
+                || state.generation != connection.generation
+            {
+                break;
+            }
+            let now = Instant::now();
+            let idle = connection.activity.lock().unwrap().elapsed();
+            if !inner.options.heartbeat_timeout.is_zero() && idle >= inner.options.heartbeat_timeout
+            {
+                drop(state);
+                inner.disconnected(connection.generation);
+                break;
+            }
+            if state.process_id.is_some()
+                && !inner.options.heartbeat_interval.is_zero()
+                && now >= next_heartbeat
+            {
+                drop(state);
+                heartbeat_seq += 1;
+                let _ = inner.send(&connection, &heartbeat(inner.source, heartbeat_seq), true);
+                next_heartbeat = Instant::now() + inner.options.heartbeat_interval;
+                continue;
+            }
+            let mut wait = Duration::from_secs(3600);
+            if state.process_id.is_some() && !inner.options.heartbeat_interval.is_zero() {
+                wait = wait.min(next_heartbeat.saturating_duration_since(now));
+            }
+            if !inner.options.heartbeat_timeout.is_zero() {
+                wait = wait.min(inner.options.heartbeat_timeout.saturating_sub(idle));
+            }
+            state = inner.changed.wait_timeout(state, wait).unwrap().0;
+            drop(state);
+        }
+        connection.closer.shutdown();
+        if let Some(worker) = reader.take() {
+            let _ = worker.join();
+        }
+        if inner.state.lock().unwrap().status == ConnectionStatus::Closed
+            || !inner.options.reconnect
+        {
+            break;
+        }
+        let mut delay = inner.options.reconnect_initial_delay;
+        drop(inner);
+        loop {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let until = Instant::now() + delay;
+            let mut state = inner.state.lock().unwrap();
+            while state.status != ConnectionStatus::Closed && Instant::now() < until {
+                state = inner
+                    .changed
+                    .wait_timeout(state, until.saturating_duration_since(Instant::now()))
+                    .unwrap()
+                    .0;
+            }
+            if state.status == ConnectionStatus::Closed {
+                return;
+            }
+            let options = inner.options.clone();
+            drop(state);
+            drop(inner);
+            let dial = Stream::connect(&endpoint, options.connect_timeout);
+            let Some(inner) = weak.upgrade() else {
+                if let Ok(stream) = dial {
+                    stream.shutdown();
+                }
+                return;
+            };
+            if inner.state.lock().unwrap().status == ConnectionStatus::Closed {
+                if let Ok(stream) = dial {
+                    stream.shutdown();
+                }
+                return;
+            }
+            if let Ok(stream) = dial {
+                let generation = {
+                    let state = inner.state.lock().unwrap();
+                    state.generation.checked_add(1)
+                };
+                let Some(generation) = generation else {
+                    inner.close();
+                    return;
+                };
+                if let Ok(next) =
+                    connection_from_stream(stream, generation, &registry, inner.timeout)
+                {
+                    {
+                        let mut state = inner.state.lock().unwrap();
+                        if state.status == ConnectionStatus::Closed {
+                            next.closer.shutdown();
+                            return;
+                        }
+                        state.generation = generation;
+                        state.connection = Some(next.clone());
+                        state.process_id = None;
+                        state.session = None;
+                        state.status = ConnectionStatus::Recovering;
+                        for receiver in inner.samples.lock().unwrap().values_mut() {
+                            receiver.sequences.clear();
+                        }
+                        inner.changed.notify_all();
+                    }
+                    if let Ok(worker) = start_reader(&inner, &next, registry.clone()) {
+                        reader = Some(worker);
+                        connection = next;
+                        let greeting = proxy_request(
+                            inner.source,
+                            inner.next_id.fetch_add(1, Ordering::Relaxed),
+                            "vnx.ProxyInterface.on_remote_connect",
+                            json!({"process_id":inner.source}),
+                        );
+                        if inner
+                            .send(&connection, &greeting, true)
+                            .and_then(|_| restore(&inner, &connection))
+                            .is_ok()
+                        {
+                            break;
+                        }
+                        inner.disconnected(generation);
+                        connection.closer.shutdown();
+                        if let Some(worker) = reader.take() {
+                            let _ = worker.join();
+                        }
+                    } else {
+                        inner.disconnected(generation);
+                    }
+                }
+            }
+            delay = delay.saturating_mul(2).min(options.reconnect_max_delay);
+        }
+    }
+    if let Some(worker) = reader {
+        let _ = worker.join();
+    }
+}
+fn connection_from_stream(
+    stream: Stream,
+    generation: u64,
+    registry: &Registry,
+    timeout: Duration,
+) -> Result<Arc<Connection>> {
+    connection(stream, generation, registry, timeout)
+}
+
+/// A reconnecting multiplexed native VNX client. Only authentication and live
+/// subscriptions are restored: RPCs and published samples are never retransmitted.
+#[derive(Clone)]
+pub struct NetworkClient {
+    inner: Arc<NetworkInner>,
+    _owner: Arc<ClientOwner>,
+}
+impl NetworkClient {
+    pub fn connect(
+        endpoint: &Endpoint,
+        service: &str,
+        registry: Registry,
+        timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with_options(
+            endpoint,
+            service,
+            registry,
+            timeout,
+            ClientOptions::default(),
+        )
+    }
+    pub fn connect_with_options(
+        endpoint: &Endpoint,
+        service: &str,
+        mut registry: Registry,
+        timeout: Duration,
+        options: ClientOptions,
+    ) -> Result<Self> {
+        if timeout.is_zero()
+            || options.connect_timeout.is_zero()
+            || options.reconnect_initial_delay.is_zero()
+            || options.reconnect_max_delay < options.reconnect_initial_delay
+        {
+            return Err(invalid(
+                "timeouts/backoff must be positive and maximum delay must cover initial delay",
+            ));
+        }
+        register_types(&mut registry)?;
+        let stream = Stream::connect(endpoint, timeout)?;
+        let connection = connection(stream, 1, &registry, timeout)?;
+        let source = crate::util::random_nonzero_u64()?;
+        let inner = Arc::new(NetworkInner {
+            state: Mutex::new(ClientState {
+                status: ConnectionStatus::Recovering,
+                generation: 1,
+                connection: Some(connection.clone()),
+                process_id: None,
+                session: None,
+            }),
+            changed: Condvar::new(),
+            pending: Mutex::new(BTreeMap::new()),
+            samples: Mutex::new(BTreeMap::new()),
+            subscription_lock: Mutex::new(()),
+            login_lock: Mutex::new(()),
+            credentials: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+            source,
+            service: crate::hash::hash64(service),
+            timeout,
+            options,
+            supervisor: Mutex::new(None),
+        });
+        let owner = Arc::new(ClientOwner {
+            inner: inner.clone(),
+        });
+        let reader = start_reader(&inner, &connection, registry.clone())?;
+        let greeting = proxy_request(
+            source,
+            inner.next_id.fetch_add(1, Ordering::Relaxed),
+            "vnx.ProxyInterface.on_remote_connect",
+            json!({"process_id":source}),
+        );
+        if let Err(error) = inner.send(&connection, &greeting, true) {
+            inner.close();
+            let _ = reader.join();
+            return Err(error);
+        }
+        let weak = Arc::downgrade(&inner);
+        let endpoint = endpoint.clone();
+        *inner.supervisor.lock().unwrap() = Some(
+            thread::Builder::new()
+                .name("vnx-reconnect".into())
+                .spawn(move || supervise(weak, endpoint, registry, connection, reader))?,
+        );
+        Ok(Self {
+            inner,
+            _owner: owner,
+        })
+    }
+    pub fn connection_status(&self) -> ConnectionStatus {
+        self.inner.state.lock().unwrap().status
+    }
+    pub fn wait_on_connect(&self) -> Result<u64> {
+        let deadline = Instant::now() + self.inner.timeout;
+        let mut state = self.inner.state.lock().unwrap();
+        loop {
+            if state.status == ConnectionStatus::Closed
+                || (!self.inner.options.reconnect && state.status == ConnectionStatus::Disconnected)
+            {
+                return Err(Error::Closed);
+            }
+            if state.status == ConnectionStatus::Ready {
+                if let Some(id) = state.process_id {
+                    return Ok(id);
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::Timeout);
+            }
+            state = self.inner.changed.wait_timeout(state, left).unwrap().0;
         }
     }
     pub fn call_value(&self, method: &str, args: Value) -> Result<Value> {
@@ -1563,82 +2286,35 @@ impl NetworkClient {
     pub fn call_async_value(&self, method: &str, args: Value) -> Result<RpcCall> {
         self.call_destination(self.inner.service, method, args)
     }
-    fn call_destination(&self, destination: u64, method: &str, mut args: Value) -> Result<RpcCall> {
+    fn call_destination(&self, destination: u64, method: &str, args: Value) -> Result<RpcCall> {
         if !args.is_object() {
             return Err(invalid("method arguments must be an object"));
         }
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(Error::Closed);
-        }
-        args.as_object_mut()
-            .unwrap()
-            .insert("__type".into(), Value::String(method.into()));
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        if id == 0 {
-            return Err(invalid("request ID exhausted"));
-        }
-        let (mut call, pipe) = RpcCall::pending(id, self.inner.timeout)?;
-        {
-            let mut pending = self.inner.pending.lock().unwrap();
-            if self.inner.closed.load(Ordering::Acquire) {
-                return Err(Error::Closed);
-            }
-            if pending.len() >= 1024 {
-                return Err(Error::Overflow);
-            }
-            pending.insert(id, pipe);
-        }
-        let weak = Arc::downgrade(&self.inner);
-        call.on_cancel(move || {
-            if let Some(inner) = weak.upgrade() {
-                inner.pending.lock().unwrap().remove(&id);
-            }
-        });
-        let request = json!({"__type":"vnx.Request","stream":0,"flags":1,"hop_count":0,"src_mac":self.inner.source,"dst_mac":destination,"session":0,"request_id":id,"method":args});
-        let mut writer = self.inner.writer.lock().unwrap();
-        writer.write(&request)?;
-        writer.flush()?;
-        Ok(call)
+        let deadline = Instant::now() + self.inner.timeout;
+        let connection = self.inner.wait_connection(deadline, false, false)?;
+        self.inner
+            .request(&connection, destination, method, args, deadline, false)
     }
-    /// Authenticate using the native Proxy exchange (SHA256 of the plaintext is
-    /// sent in on_login; the server responds with on_remote_login Session).
+    /// Stores only a successfully authenticated SHA256 hash for reconnect. An
+    /// explicit replacement attempt first forgets all older credentials.
     pub fn login(&self, username: &str, password: &str) -> Result<Session> {
         use sha2::{Digest, Sha256};
-        let _login = self.inner.login_lock.lock().unwrap();
-        *self.inner.remote_session.lock().unwrap() = None;
-        let password = Sha256::digest(password.as_bytes())
+        let deadline = Instant::now() + self.inner.timeout;
+        let password_hash = Sha256::digest(password.as_bytes())
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        self.call_destination(
-            crate::hash::hash64("vnx.remote"),
-            "vnx.ProxyInterface.on_login",
-            json!({"name":username,"password":password}),
-        )?
-        .wait()?;
-        let deadline = Instant::now() + self.inner.timeout;
-        let mut session = self.inner.remote_session.lock().unwrap();
-        loop {
-            if let Some(session) = session.as_ref() {
-                if session.user != username {
-                    return Err(Error::PermissionDenied("login failed".into()));
-                }
-                return Ok(session.clone());
-            }
-            if self.inner.closed.load(Ordering::Acquire) {
-                return Err(Error::Closed);
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Timeout);
-            }
-            session = self
-                .inner
-                .session_changed
-                .wait_timeout(session, remaining)
-                .unwrap()
-                .0;
-        }
+        let _login = lock_before(&self.inner.login_lock, deadline)?;
+        *self.inner.credentials.lock().unwrap() = None;
+        let connection = self.inner.wait_connection(deadline, true, false)?;
+        let session = self
+            .inner
+            .login_hash(&connection, username, &password_hash, deadline)?;
+        *self.inner.credentials.lock().unwrap() = Some(Credentials {
+            username: username.into(),
+            password_hash,
+        });
+        Ok(session)
     }
     pub fn remote_session(&self) -> Result<Session> {
         let response = self
@@ -1657,17 +2333,21 @@ impl NetworkClient {
         overflow: crate::runtime::OverflowPolicy,
         replay: bool,
     ) -> Result<NetworkSubscription> {
-        if self.inner.closed.load(Ordering::Acquire) {
+        let deadline = Instant::now() + self.inner.timeout;
+        let connection = self.inner.wait_connection(deadline, false, false)?;
+        let _subscriptions = lock_before(&self.inner.subscription_lock, deadline)?;
+        if !self.inner.valid(&connection, false) {
             return Err(Error::Closed);
         }
         let pipe = crate::runtime::Pipe::new(capacity, overflow)?;
         let missed = Arc::new(AtomicU64::new(0));
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        {
+        let first = {
             let mut samples = self.inner.samples.lock().unwrap();
             if samples.len() >= 1024 {
                 return Err(Error::Overflow);
             }
+            let first = !samples.values().any(|s| s.active && s.topic == topic);
             samples.insert(
                 id,
                 SampleReceiver {
@@ -1675,40 +2355,87 @@ impl NetworkClient {
                     pipe: pipe.clone(),
                     missed: missed.clone(),
                     replay,
+                    active: false,
+                    sequences: BTreeMap::new(),
                 },
             );
+            first
+        };
+        if !first && replay {
+            let cached: Vec<_> = connection
+                .cache
+                .lock()
+                .unwrap()
+                .values
+                .values()
+                .map(|(sample, _)| sample.clone())
+                .collect();
+            if let Some(receiver) = self.inner.samples.lock().unwrap().get_mut(&id) {
+                for mut sample in cached {
+                    if topic.is_empty()
+                        || topic == sample.topic
+                        || sample
+                            .topic
+                            .strip_prefix(topic)
+                            .is_some_and(|s| s.starts_with('.'))
+                    {
+                        let channel = (sample.src_mac, sample.topic.clone());
+                        if receiver.sequences.get(&channel) == Some(&sample.seq_num) {
+                            continue;
+                        }
+                        sample.replay = true;
+                        receiver.sequences.insert(channel, sample.seq_num);
+                        if receiver.pipe.try_send(sample).is_err() {
+                            receiver.missed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
         }
-        let subscription = NetworkSubscription {
+        if first {
+            if let Err(error) = self
+                .inner
+                .request(
+                    &connection,
+                    crate::hash::hash64("vnx.remote"),
+                    "vnx.ProxyInterface.enable_export",
+                    json!({"topic_name":topic}),
+                    deadline,
+                    false,
+                )
+                .and_then(|call| call.wait())
+            {
+                self.inner.samples.lock().unwrap().remove(&id);
+                pipe.close();
+                return Err(error);
+            }
+        }
+        if let Some(receiver) = self.inner.samples.lock().unwrap().get_mut(&id) {
+            receiver.active = true;
+        } else {
+            return Err(Error::Closed);
+        }
+        Ok(NetworkSubscription {
             id,
             topic: topic.into(),
             inner: Arc::downgrade(&self.inner),
             pipe,
             missed,
-        };
-        self.call_destination(
-            crate::hash::hash64("vnx.remote"),
-            "vnx.ProxyInterface.enable_export",
-            json!({"topic_name":topic}),
-        )?
-        .wait()?;
-        Ok(subscription)
+        })
     }
     pub fn publish(&self, topic: &str, value: Value) -> Result<()> {
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(Error::Closed);
-        }
+        let deadline = Instant::now() + self.inner.timeout;
+        let connection = self.inner.wait_connection(deadline, false, false)?;
         let sample = json!({"__type":"vnx.Sample","stream":0,"flags":0,"hop_count":0,"src_mac":self.inner.source,"seq_num":self.inner.next_id.fetch_add(1,Ordering::Relaxed),"recv_time":crate::time::now_micros(),"topic":topic,"value":value});
-        let mut writer = self.inner.writer.lock().unwrap();
-        writer.write(&sample)?;
-        writer.flush()
+        self.inner.send_until(&connection, &sample, false, deadline)
     }
     pub fn close(&self) {
         self.inner.close();
     }
 }
 
-/// Stream samples share a reader with RPC replies. A full subscriber queue never
-/// blocks that reader; dropped() counts rejected or overwritten samples.
+/// Subscription handles survive transient disconnects. Full queues never block
+/// RPC replies; dropping the last local topic handle removes its remote export.
 pub struct NetworkSubscription {
     id: u64,
     topic: String,
@@ -1732,17 +2459,30 @@ impl NetworkSubscription {
     pub fn close(&self) {
         self.pipe.close();
         if let Some(inner) = self.inner.upgrade() {
-            if inner.samples.lock().unwrap().remove(&self.id).is_some()
-                && !inner.closed.load(Ordering::Acquire)
-            {
-                let request = proxy_request(
-                    inner.source,
-                    inner.next_id.fetch_add(1, Ordering::Relaxed),
-                    "vnx.ProxyInterface.disable_export",
-                    json!({"topic_name":self.topic}),
-                );
-                let mut output = inner.writer.lock().unwrap();
-                let _ = output.write(&request).and_then(|_| output.flush());
+            let _subscriptions = inner.subscription_lock.lock().unwrap();
+            let last = {
+                let mut samples = inner.samples.lock().unwrap();
+                let removed = samples.remove(&self.id).is_some();
+                removed && !samples.values().any(|s| s.active && s.topic == self.topic)
+            };
+            if last {
+                let connection = {
+                    let state = inner.state.lock().unwrap();
+                    if state.status == ConnectionStatus::Ready {
+                        state.connection.clone()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(connection) = connection {
+                    let request = proxy_request(
+                        inner.source,
+                        inner.next_id.fetch_add(1, Ordering::Relaxed),
+                        "vnx.ProxyInterface.disable_export",
+                        json!({"topic_name":self.topic}),
+                    );
+                    let _ = inner.send(&connection, &request, false);
+                }
             }
         }
     }
@@ -1750,5 +2490,85 @@ impl NetworkSubscription {
 impl Drop for NetworkSubscription {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+#[cfg(test)]
+mod reconnect_deadlines {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    #[test]
+    fn waiting_for_a_writer_cannot_send_an_expired_rpc() -> Result<()> {
+        let mut registry = Registry::new();
+        for name in ["test.deadline.call", "test.deadline.call.return"] {
+            registry.register(TypeCode {
+                name: name.into(),
+                type_hash: crate::hash64(name),
+                code_hash: crate::hash64(format!("{name}:empty")),
+                is_class: true,
+                is_method: !name.ends_with(".return"),
+                is_return: name.ends_with(".return"),
+                ..Default::default()
+            })?;
+        }
+        let runtime = Runtime::new()?;
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = count.clone();
+        let mut methods = crate::runtime::Methods::new();
+        methods.add("test.deadline.call", None, move |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Value::Null)
+        });
+        runtime.register("deadline", methods)?;
+        let mut server = Server::bind(
+            "127.0.0.1:0".parse()?,
+            runtime.clone(),
+            registry.clone(),
+            ServerOptions {
+                services: ["deadline".into()].into(),
+                ..Default::default()
+            },
+        )?;
+        let client = NetworkClient::connect_with_options(
+            server.endpoint(),
+            "deadline",
+            registry,
+            Duration::from_millis(100),
+            ClientOptions {
+                heartbeat_interval: Duration::ZERO,
+                heartbeat_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+        )?;
+        client.wait_on_connect()?;
+        let connection = client
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .connection
+            .clone()
+            .unwrap();
+        let writer = connection.writer.lock().unwrap();
+        let blocked = client.clone();
+        let (sent, done) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = blocked.call_value("test.deadline.call", json!({}));
+            sent.send(result).unwrap();
+        });
+        assert!(matches!(
+            done.recv_timeout(Duration::from_secs(1))
+                .expect("writer wait exceeded request deadline"),
+            Err(Error::Timeout)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        drop(writer);
+        worker.join().unwrap();
+        client.call_value("test.deadline.call", json!({}))?;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        client.close();
+        server.shutdown();
+        runtime.shutdown();
+        Ok(())
     }
 }

@@ -307,6 +307,7 @@ impl Process {
     ) -> Result<crate::net::ServerOptions> {
         let authenticate = self.inner.auth.clone();
         let validate = self.inner.auth.clone();
+        let release = self.inner.auth.clone();
         Ok(crate::net::ServerOptions {
             process_id: self.id(),
             services: services.into_iter().collect(),
@@ -315,6 +316,7 @@ impl Process {
                 authenticate.authenticate_hash(name, hash)
             })),
             session_validator: Some(Arc::new(move |id| validate.get_session(id))),
+            session_releaser: Some(Arc::new(move |id| release.logout(id))),
             ..Default::default()
         })
     }

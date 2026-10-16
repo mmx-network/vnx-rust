@@ -104,6 +104,55 @@ fn rust_client_calls_native_cpp_service() -> Result<()> {
 
 #[test]
 #[ignore = "requires tests/cpp/network.cpp compiled and VNX_CPP_NETWORK_ORACLE"]
+fn rust_client_reconnects_to_native_cpp_streams() -> Result<()> {
+    struct Peer(std::process::Child);
+    impl Drop for Peer {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let oracle = std::env::var("VNX_CPP_NETWORK_ORACLE")
+        .map_err(|_| vnx::error::invalid("set VNX_CPP_NETWORK_ORACLE"))?;
+    let mut peer = Peer(
+        Command::new(oracle)
+            .arg("reconnect")
+            .stdout(Stdio::piped())
+            .spawn()?,
+    );
+    let mut endpoint = String::new();
+    BufReader::new(peer.0.stdout.take().unwrap()).read_line(&mut endpoint)?;
+    let client = NetworkClient::connect(
+        &endpoint.trim().parse()?,
+        "Node",
+        registry()?,
+        Duration::from_secs(3),
+    )?;
+    for round in 0..3 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while client.wait_on_connect().map_err(|error| {
+            vnx::error::invalid(format!("connection identity in round {round}: {error}"))
+        })? != 5051000 + round
+        {
+            assert!(std::time::Instant::now() < deadline, "reconnect stalled");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            client
+                .call_value("mmx.Node.get_height", json!({}))
+                .map_err(|error| {
+                    vnx::error::invalid(format!("native RPC in round {round}: {error}"))
+                })?["_ret_0"],
+            5050001 + round
+        );
+    }
+    assert!(peer.0.wait()?.success());
+    client.close();
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires tests/cpp/network.cpp compiled and VNX_CPP_NETWORK_ORACLE"]
 fn native_cpp_proxy_bootstrap_login_subscriptions_and_heartbeats() -> Result<()> {
     use std::sync::Arc;
     use vnx::auth::{final_hash, password_hash, AuthenticationServer, User};

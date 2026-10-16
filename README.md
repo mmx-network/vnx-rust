@@ -64,7 +64,13 @@ The runtime provides bounded pipes with blocking/reject/drop policies, hierarchi
 
 `net::Server` and `net::NetworkClient` use native VNX Request/Return/Sample/Flow/Proxy messages over TCP or Unix sockets, without additional framing. They support greeting/connection identity, login, remote sessions, topic subscriptions/replay, heartbeat handling and clean shutdown. Services and topics are exported explicitly. Authentication accepts native client password hashes and existing VNX role/user configuration, creates random session IDs, and checks revocation through the process adapter.
 
-Automatic reconnect, configured forwarding/tunnels and compression are not implemented. VNX Recorder/Player files and UI/add-on implementations (HTTP/WebAPI, OpenCL, Qt) are outside this MMX core dependency layer. Declaring their VNI schemas is supported; their application behavior is not generated. This repository supplies the VNX foundation, not the MMX node/VM/consensus implementation.
+`NetworkClient::connect` enables automatic reconnect after a connection drops. Recovery uses bounded exponential backoff and fresh binary readers/writers, authenticates again, and restores live topic subscriptions before reporting the connection ready. Successful logins retain the username and native SHA256 password hash in memory for recovery; plaintext passwords are not retained. Failed authentication during recovery never exposes an anonymous connection as ready. Subscription handles and their queues survive disconnects; subscriptions requesting replay receive the new peer's retained samples.
+
+`wait_on_connect` waits for recovery to finish. New RPC calls wait for a ready connection within their request timeout. Calls already in flight fail on disconnect and are **never resent**, because a remote transaction may have executed before its response was lost. Publications are not queued or replayed. `connect_with_options` accepts `ClientOptions` to configure or disable retries and heartbeat expiry; `connection_status` distinguishes disconnected, recovering, ready and closed states. Initial connection errors are returned to the caller. Explicit close, or dropping the last client handle, stops recovery and wakes blocked calls and subscriptions.
+
+Defaults are a 100 ms retry delay doubling to 5 seconds, a 1 second reconnect dial timeout, heartbeats every 10 seconds and connection expiry after 30 seconds without incoming bytes. A zero heartbeat interval or timeout disables that behavior. `Process::network_options` also releases authenticated server sessions when a login is replaced or its socket closes; custom authorities can provide `ServerOptions::session_releaser`.
+
+Configured forwarding/tunnels and compression are not implemented. VNX Recorder/Player files and UI/add-on implementations (HTTP/WebAPI, OpenCL, Qt) are outside this MMX core dependency layer. Declaring their VNI schemas is supported; their application behavior is not generated. This repository supplies the VNX foundation, not the MMX node/VM/consensus implementation.
 
 ## Conformance checks
 
@@ -84,7 +90,7 @@ An optional, independent C++ check requires an existing MMX CMake build with `mm
 python3 tests/cpp/check.py --mmx-root ../mmx-node
 ```
 
-That check builds a disposable oracle, verifies native C++ reading of Rust output, and runs live peer tests, including an actual `vnx::Proxy` connecting, logging in, calling a typed MMX client, importing a topic and surviving heartbeats. Only the disposable oracle links C++; it is never a Rust dependency.
+That check builds a disposable oracle, verifies native C++ reading of Rust output, and runs live peer tests, including an actual `vnx::Proxy` connecting, logging in, calling a typed MMX client, importing a topic and surviving heartbeats, plus repeated Rust client reconnections to a native C++ peer. Only the disposable oracle links C++; it is never a Rust dependency.
 
 ## Sources and licensing
 
