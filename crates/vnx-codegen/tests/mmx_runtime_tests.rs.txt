@@ -1,0 +1,35 @@
+#[cfg(test)] mod mmx_compatibility_tests {
+use super::*;
+use ::vnx::{VnxType, serde_json::json};
+fn fixture(name:&str)->Vec<u8> {
+    let text=std::fs::read_to_string(std::path::Path::new(CPP_FIXTURE_DIR).join(format!("{name}.hex"))).unwrap();
+    let text=text.trim();
+    (0..text.len()).step_by(2).map(|i|u8::from_str_radix(&text[i..i+2],16).unwrap()).collect()
+}
+fn roundtrip<T: VnxType+PartialEq+std::fmt::Debug>(value:&T, registry:&::vnx::Registry) {
+    let encoded=value.encode(registry).unwrap_or_else(|e|panic!("{} encode: {e}", T::TYPE_NAME));
+    assert_eq!(&T::decode(&encoded).unwrap_or_else(|e|panic!("{} decode: {e}",T::TYPE_NAME)),value);
+}
+#[test] fn cpp_fixture_values_decode_into_generated_types() {
+    let registry=vnx_registry().unwrap();
+    let key=mmx::KeyFile::decode(&fixture("key")).unwrap();
+    assert_eq!(key.seed_value[0],1); assert_eq!(key.seed_value[31],32); roundtrip(&key,&registry);
+    let log=vnx::LogMsg::decode(&fixture("log")).unwrap(); assert_eq!(log.module,"Node"); roundtrip(&log,&registry);
+    let params=mmx::ChainParams::decode(&fixture("params")).unwrap(); assert_eq!(params.network,"mainnet"); roundtrip(&params,&registry);
+    let header=mmx::BlockHeader::decode(&fixture("block")).unwrap(); assert_eq!(header.height,5050001); roundtrip(&header,&registry);
+    let req=vnx::Request::decode(&fixture("request")).unwrap(); assert_eq!(req.request_id,42); assert_eq!(req.method["__type"],"mmx.Node.get_height"); roundtrip(&req,&registry);
+}
+#[test] fn actual_mmx_defaults_maps_enums_aliases_and_polymorphic_values() {
+    let registry=vnx_registry().unwrap();
+    let tx=mmx::Transaction::default(); assert_eq!(tx.expires,u32::MAX); assert_eq!(tx.fee_ratio,1024); roundtrip(&tx,&registry);
+    let mut info=mmx::FarmInfo::default(); info.plot_count.insert(32,5); info.harvester_bytes.insert("machine".into(),(123,456)); roundtrip(&info,&registry);
+    let method=mmx::Node_get_height::default().to_value().unwrap();
+    let req=vnx::Request::from_value(json!({"arguments":method})).unwrap(); roundtrip(&req,&registry);
+    let enum_value=mmx::node_type_e::FULL_NODE;
+    assert_eq!(::vnx::serde_json::to_value(&enum_value).unwrap(),"FULL_NODE"); roundtrip(&enum_value,&registry);
+    let unknown=mmx::node_type_e{value:0xdeadbeef}; roundtrip(&unknown,&registry);
+    let mut filter=mmx::query_filter_t::default(); filter.r#type=Some(mmx::tx_type_e::RECEIVE); roundtrip(&filter,&registry);
+    let mut pool=mmx::pooling_stats_t::default(); pool.error_count.insert(mmx::pooling_error_e::default(),17); roundtrip(&pool,&registry);
+    let mut owners=mmx::contract::MultiSig::default(); owners.owners.insert(::vnx::Fixed([2_u8;32])); owners.owners.insert(::vnx::Fixed([1_u8;32])); owners.owners.insert(::vnx::Fixed([2_u8;32])); assert_eq!(owners.owners.len(),2); roundtrip(&owners,&registry);
+}
+}

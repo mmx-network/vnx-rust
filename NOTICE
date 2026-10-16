@@ -1,0 +1,5 @@
+vnx-rust is an independent native Rust implementation of VNX facilities for MMX.
+The VNX wire format, VNI grammar, CRC64 identity rules, protocol schema metadata
+and logging conventions are based on the VNX / vnx-base project (Automy Inc.).
+Compatibility fixtures and the optional oracle reference the MMX node project.
+See source comments and README.md for provenance and verification instructions.
