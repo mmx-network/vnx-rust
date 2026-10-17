@@ -56,6 +56,8 @@ Log messages retain `[Module] ERROR: ...`, `WARN`, `INFO`, `DEBUG` and numeric-l
 
 `Config` loads the existing MMX configuration trees: parent directories, namespace JSON files, bare config files, relaxed VNX JSON, `+` array appends, CLI aliases/overrides and protected namespaces. File writes use temporary files, fsync and atomic replacement. Process configuration RPCs honor access controls. Startup config printing is available through `ProcessOptions::print_config`.
 
+Relaxed VNX strings follow native `read_json` escapes: `\t`, `\r`, `\n`, `\b` and `\f` decode as control bytes; other escaped bytes are copied literally. For example, `\u0041` reads as the text `u0041`. Standard JSON APIs remain available separately through `serde_json`.
+
 `Terminal` supplies the familiar line commands: `debug`, `errors`, `grep`, `journal`, `config`, `module`, `topic`, `call`/`exec` and `quit`. Applications provide stdin and a writer, and may add their preferred line editor. Signal handlers and raw-terminal editing are application concerns.
 
 ### Messaging, RPC and transport

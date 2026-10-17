@@ -72,6 +72,17 @@ fn relaxed_config_json_preserves_vnx_scalars_and_precision() {
 }
 
 #[test]
+fn relaxed_json_string_escapes_match_native_read_json() {
+    assert_eq!(
+        parse_json(r#""\u0041\u0000\q\/\\\"""#).unwrap(),
+        "u0041u0000q/\\\""
+    );
+    assert_eq!(parse_json(r#""\t\r\n\b\f""#).unwrap(), "\t\r\n\u{8}\u{c}");
+    assert_eq!(parse_json("\"世界\nraw\"\n").unwrap(), "世界\nraw");
+    assert!(parse_json("\"trailing\\").is_err());
+}
+
+#[test]
 fn config_namespaces_append_protection_and_public_write_are_atomic() {
     let config = Config::new();
     config

@@ -515,20 +515,44 @@ impl Parser<'_> {
         self.whitespace();
         match self.input.get(self.offset).copied() {
             Some(b'"') => {
-                let start = self.offset;
                 self.offset += 1;
+                let mut bytes = Vec::new();
                 loop {
-                    match self.input.get(self.offset) {
-                        Some(b'\\') => self.offset += 2,
+                    match self.input.get(self.offset).copied() {
+                        Some(b'\\') => {
+                            self.offset += 1;
+                            let escaped = self
+                                .input
+                                .get(self.offset)
+                                .copied()
+                                .ok_or_else(|| invalid("unterminated JSON escape"))?;
+                            // Native read_json supports these five escapes;
+                            // every other escaped byte is copied literally.
+                            // In particular, \\u0041 reads as "u0041", not "A".
+                            bytes.push(match escaped {
+                                b't' => b'\t',
+                                b'r' => b'\r',
+                                b'n' => b'\n',
+                                b'b' => 8,
+                                b'f' => 12,
+                                other => other,
+                            });
+                            self.offset += 1;
+                        }
                         Some(b'"') => {
                             self.offset += 1;
                             break;
                         }
-                        Some(_) => self.offset += 1,
+                        Some(byte) => {
+                            bytes.push(byte);
+                            self.offset += 1;
+                        }
                         None => return Err(invalid("unterminated JSON string")),
                     }
                 }
-                serde_json::from_slice(&self.input[start..self.offset]).map_err(Into::into)
+                String::from_utf8(bytes)
+                    .map(Value::String)
+                    .map_err(|_| invalid("invalid UTF-8 JSON string"))
             }
             Some(b'[') => {
                 self.offset += 1;
