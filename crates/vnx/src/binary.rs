@@ -41,6 +41,7 @@ pub struct Reader<R> {
     pending: Option<u8>,
     data_order: ByteOrder,
     schema_orders: BTreeMap<u64, ByteOrder>,
+    utf8_lossy: bool,
 }
 impl<R: Read> Reader<R> {
     pub fn new(input: R, registry: Registry) -> Self {
@@ -53,6 +54,7 @@ impl<R: Read> Reader<R> {
             pending: None,
             data_order: ByteOrder::Little,
             schema_orders: BTreeMap::new(),
+            utf8_lossy: false,
         }
     }
     pub fn with_limits(mut self, limits: Limits) -> Self {
@@ -62,6 +64,13 @@ impl<R: Read> Reader<R> {
     pub fn with_byte_order(mut self, order: ByteOrder) -> Self {
         self.order = order;
         self.data_order = order;
+        self
+    }
+    /// Decode native byte strings into a lossy JSON text view. Strict UTF-8 is
+    /// the default. Consumers needing exact bytes must retain the input stream;
+    /// this option is useful when inspecting payload boundaries or schemas.
+    pub fn with_utf8_lossy(mut self, enabled: bool) -> Self {
+        self.utf8_lossy = enabled;
         self
     }
     pub fn registry(&self) -> &Registry {
@@ -182,7 +191,15 @@ impl<R: Read> Reader<R> {
         if n > self.limits.max_string_bytes {
             return Err(Error::Limit("string bytes".into()));
         }
-        String::from_utf8(self.raw(n)?).map_err(|_| invalid("invalid UTF-8"))
+        let bytes = self.raw(n)?;
+        self.decode_text(bytes)
+    }
+    fn decode_text(&self, bytes: Vec<u8>) -> Result<String> {
+        if self.utf8_lossy {
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        } else {
+            String::from_utf8(bytes).map_err(|_| invalid("invalid UTF-8"))
+        }
     }
     fn words(&mut self, width: usize) -> Result<Vec<u16>> {
         let n = self.n(width)? as usize;
@@ -585,7 +602,7 @@ impl<R: Read> Reader<R> {
                 let n = self.count()?;
                 if matches!(c.as_ref(), Code::I8) {
                     let b = self.raw(n)?;
-                    String::from_utf8(b)
+                    self.decode_text(b)
                         .map_err(|_| invalid("invalid UTF-8 character list"))?
                         .into()
                 } else {
