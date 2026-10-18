@@ -844,11 +844,18 @@ impl Listener {
         match self {
             Self::Tcp(value) => {
                 let (stream, _) = value.accept()?;
+                // Winsock inherits the listener's nonblocking mode. Only the
+                // accept loop polls; each connection uses blocking VNX codecs.
+                stream.set_nonblocking(false)?;
                 stream.set_nodelay(true)?;
                 Ok(Stream::Tcp(stream))
             }
             #[cfg(unix)]
-            Self::Unix(value) => Ok(Stream::Unix(value.accept()?.0)),
+            Self::Unix(value) => {
+                let (stream, _) = value.accept()?;
+                stream.set_nonblocking(false)?;
+                Ok(Stream::Unix(stream))
+            }
         }
     }
 }
@@ -2497,6 +2504,33 @@ impl Drop for NetworkSubscription {
 mod reconnect_deadlines {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    #[test]
+    fn accepted_tcp_stream_waits_for_data_from_an_idle_peer() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let mut peer = TcpStream::connect(listener.local_addr()?)?;
+        let mut accepted = Listener::Tcp(listener).accept()?;
+        match &accepted {
+            Stream::Tcp(stream) => stream.set_read_timeout(Some(Duration::from_secs(2)))?,
+            #[cfg(unix)]
+            Stream::Unix(_) => unreachable!("TCP listener returned a Unix stream"),
+        }
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut byte = [0];
+            let result = accepted.read_exact(&mut byte).map(|()| byte[0]);
+            send.send(result).unwrap();
+        });
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        peer.write_all(&[42])?;
+        assert_eq!(receive.recv_timeout(Duration::from_secs(2)).unwrap()?, 42);
+        reader.join().unwrap();
+        Ok(())
+    }
+
     #[test]
     fn waiting_for_a_writer_cannot_send_an_expired_rpc() -> Result<()> {
         let mut registry = Registry::new();

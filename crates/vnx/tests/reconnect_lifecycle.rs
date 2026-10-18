@@ -325,6 +325,9 @@ fn silent_peer_timeout_reconnects_even_while_outgoing_heartbeats_succeed() -> Re
                     Err(error) => return Err(error.into()),
                 }
             };
+            // Winsock inherits the listener's nonblocking mode on accept.
+            // This fake peer uses blocking VNX reads and a socket timeout.
+            socket.set_nonblocking(false)?;
             socket.set_read_timeout(Some(Duration::from_secs(3)))?;
             let mut schemas = registry()?;
             vnx::net::register_types(&mut schemas)?;
