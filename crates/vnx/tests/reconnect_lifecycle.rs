@@ -340,8 +340,21 @@ fn silent_peer_timeout_reconnects_even_while_outgoing_heartbeats_succeed() -> Re
             let mut buffer = [0_u8; 1024];
             // Consume successful client writes, but never send a heartbeat back.
             loop {
-                if socket.read(&mut buffer)? == 0 {
-                    break;
+                match socket.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    // Closing the client can produce a reset instead of EOF
+                    // on Windows. Both confirm that the old socket was closed.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
         }
