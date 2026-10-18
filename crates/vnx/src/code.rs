@@ -1,5 +1,8 @@
 //! Validated VNX byte code. All offsets are relative to their container.
 use crate::{error::invalid, Result};
+use std::{collections::BTreeMap, mem::size_of};
+
+type SizeCache = BTreeMap<(u64, usize), Option<usize>>;
 pub const CODE_NULL: u16 = 0;
 pub const CODE_UINT8: u16 = 1;
 pub const CODE_UINT16: u16 = 2;
@@ -260,13 +263,23 @@ impl Code {
         registry: &crate::Registry,
         owner: Option<&crate::TypeCode>,
     ) -> Result<Option<usize>> {
-        self.size(registry, owner, 0)
+        self.fixed_size_bounded(registry, owner, &mut |_| Ok(()))
+    }
+    pub(crate) fn fixed_size_bounded(
+        &self,
+        registry: &crate::Registry,
+        owner: Option<&crate::TypeCode>,
+        allocate: &mut impl FnMut(usize) -> Result<()>,
+    ) -> Result<Option<usize>> {
+        self.size(registry, owner, 0, &mut SizeCache::new(), allocate)
     }
     fn size(
         &self,
         r: &crate::Registry,
         o: Option<&crate::TypeCode>,
         depth: usize,
+        cache: &mut SizeCache,
+        allocate: &mut impl FnMut(usize) -> Result<()>,
     ) -> Result<Option<usize>> {
         if depth >= 100 {
             return Err(invalid("recursive inline struct"));
@@ -276,21 +289,26 @@ impl Code {
                 .ok_or_else(|| invalid("fixed size overflow"))
         };
         Ok(match self {
-            Self::Alt(code) => code.size(r, o, depth + 1)?,
+            Self::Alt(code) => code.size(r, o, depth + 1, cache, allocate)?,
             Self::Null => Some(0),
             Self::U8 | Self::I8 | Self::Bool => Some(1),
             Self::U16 | Self::I16 => Some(2),
             Self::U32 | Self::I32 | Self::F32 => Some(4),
             Self::U64 | Self::I64 | Self::F64 => Some(8),
-            Self::Array(n, c) => c.size(r, o, depth + 1)?.map(|s| mul(*n, s)).transpose()?,
+            Self::Array(n, c) => c
+                .size(r, o, depth + 1, cache, allocate)?
+                .map(|s| mul(*n, s))
+                .transpose()?,
             Self::Matrix(d, c) => {
                 let n = d.iter().try_fold(1, |n, d| mul(n, *d))?;
-                c.size(r, o, depth + 1)?.map(|s| mul(n, s)).transpose()?
+                c.size(r, o, depth + 1, cache, allocate)?
+                    .map(|s| mul(n, s))
+                    .transpose()?
             }
             Self::Tuple(parts) => {
                 let mut n = 0usize;
                 for c in parts {
-                    let Some(s) = c.size(r, o, depth + 1)? else {
+                    let Some(s) = c.size(r, o, depth + 1, cache, allocate)? else {
                         return Ok(None);
                     };
                     n = n
@@ -304,18 +322,39 @@ impl Code {
                     *o.and_then(|t| t.depends.get(*i))
                         .ok_or_else(|| invalid("struct dependency"))?,
                 )?;
+                // Shared dependencies form a DAG, not necessarily a tree. The
+                // depth is part of the key to preserve the recursion limit.
+                let key = (t.code_hash, depth);
+                if let Some(size) = cache.get(&key) {
+                    return Ok(*size);
+                }
+                allocate(
+                    (size_of::<(u64, usize)>() + size_of::<Option<usize>>()) * 12
+                        + size_of::<usize>() * 16,
+                )?;
                 let mut n = 0usize;
                 for f in &t.fields {
                     if f.is_extended {
+                        cache.insert(key, None);
                         return Ok(None);
                     };
-                    let Some(s) = Self::from_words(&f.code)?.size(r, Some(t), depth + 1)? else {
+                    allocate(
+                        f.code
+                            .len()
+                            .saturating_mul(size_of::<Code>())
+                            .saturating_mul(3),
+                    )?;
+                    let Some(s) =
+                        Self::from_words(&f.code)?.size(r, Some(t), depth + 1, cache, allocate)?
+                    else {
+                        cache.insert(key, None);
                         return Ok(None);
                     };
                     n = n
                         .checked_add(s)
                         .ok_or_else(|| invalid("fixed size overflow"))?;
                 }
+                cache.insert(key, Some(n));
                 Some(n)
             }
             _ => None,

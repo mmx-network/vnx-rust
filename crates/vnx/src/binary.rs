@@ -4,7 +4,79 @@ use serde_json::{Map, Number, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Cursor, Read, Write},
+    mem::size_of,
 };
+
+const READ_CHUNK: usize = 16 * 1024;
+
+fn map_entry_allocation<K, V>() -> usize {
+    // A sparse B-tree may allocate a complete node for its first entry. Charge
+    // a whole node per entry, including child pointers, rather than an average.
+    size_of::<K>()
+        .saturating_add(size_of::<V>())
+        .saturating_mul(12)
+        .saturating_add(size_of::<usize>().saturating_mul(16))
+}
+fn schema_allocation(code: &TypeCode) -> usize {
+    let fields = code
+        .fields
+        .iter()
+        .chain(&code.static_fields)
+        .fold(0usize, |n, field| {
+            n.saturating_add(size_of::<Field>().saturating_mul(3))
+                .saturating_add(field.name.len())
+                .saturating_add(field.value.len())
+                .saturating_add(field.code.len().saturating_mul(6))
+        });
+    let lists = code
+        .parents
+        .len()
+        .saturating_add(code.depends.len())
+        .saturating_add(code.methods.len());
+    let enums = code.enum_map.values().fold(0usize, |n, value| {
+        n.saturating_add(map_entry_allocation::<u32, String>())
+            .saturating_add(value.len())
+    });
+    let aliases = code.alias_map.iter().fold(0usize, |n, (key, value)| {
+        n.saturating_add(map_entry_allocation::<String, String>())
+            .saturating_add(key.len())
+            .saturating_add(value.len())
+    });
+    size_of::<TypeCode>()
+        .saturating_add(code.name.len().saturating_mul(2))
+        .saturating_add(code.permission.len())
+        .saturating_add(fields)
+        .saturating_add(lists.saturating_mul(24))
+        .saturating_add(enums)
+        .saturating_add(aliases)
+}
+fn registry_allocation(code: &TypeCode) -> usize {
+    schema_allocation(code)
+        .saturating_add(map_entry_allocation::<u64, TypeCode>())
+        .saturating_add(map_entry_allocation::<String, u64>())
+        .saturating_add(map_entry_allocation::<u64, ByteOrder>())
+}
+fn schema_json_allocation(code: &TypeCode) -> usize {
+    let field_count = code.fields.len().saturating_add(code.static_fields.len());
+    schema_allocation(code)
+        .saturating_mul(4)
+        .saturating_add(map_entry_allocation::<String, Value>().saturating_mul(20))
+        .saturating_add(
+            field_count.saturating_mul(map_entry_allocation::<String, Value>().saturating_mul(8)),
+        )
+        .saturating_add(
+            code.fields
+                .iter()
+                .chain(&code.static_fields)
+                .fold(0usize, |n, f| {
+                    n.saturating_add(
+                        f.code
+                            .len()
+                            .saturating_mul(size_of::<Value>().saturating_mul(3)),
+                    )
+                }),
+        )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ByteOrder {
@@ -19,6 +91,11 @@ pub struct Limits {
     pub max_string_bytes: usize,
     pub max_value_bytes: usize,
     pub max_schemas: usize,
+    /// Conservative allocation/work budget shared by all nested decoded values.
+    /// This is separate from the serialized input-byte limit.
+    pub max_allocated_bytes: usize,
+    /// Cumulative budget for schema metadata learned by this reader.
+    pub max_schema_bytes: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -28,6 +105,8 @@ impl Default for Limits {
             max_string_bytes: 16 * 1024 * 1024,
             max_value_bytes: 64 * 1024 * 1024,
             max_schemas: 65536,
+            max_allocated_bytes: 64 * 1024 * 1024,
+            max_schema_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -37,6 +116,8 @@ pub struct Reader<R> {
     registry: Registry,
     limits: Limits,
     consumed: usize,
+    allocated: usize,
+    schema_bytes: usize,
     order: ByteOrder,
     pending: Option<u8>,
     data_order: ByteOrder,
@@ -50,6 +131,8 @@ impl<R: Read> Reader<R> {
             registry,
             limits: Limits::default(),
             consumed: 0,
+            allocated: 0,
+            schema_bytes: 0,
             order: ByteOrder::Little,
             pending: None,
             data_order: ByteOrder::Little,
@@ -84,6 +167,7 @@ impl<R: Read> Reader<R> {
     }
     pub fn read(&mut self) -> Result<Value> {
         self.consumed = 0;
+        self.allocated = 0;
         self.any(0)
     }
     /// Distinguishes clean EOF from a truncated value.
@@ -103,12 +187,14 @@ impl<R: Read> Reader<R> {
     /// Database fields can carry their schema out of band.
     pub fn read_typed_payload(&mut self, hash: u64) -> Result<Value> {
         self.consumed = 0;
-        let schema = self.registry.get(hash)?.clone();
+        self.allocated = 0;
+        let schema = self.schema_clone(hash)?;
         self.record(&schema, 0)
     }
     /// Read one entry from a schema-only stream.
     pub fn read_type_code(&mut self) -> Result<TypeCode> {
         self.consumed = 0;
+        self.allocated = 0;
         loop {
             let mut bytes = [0u8; 2];
             self.take_into(&mut bytes)?;
@@ -131,7 +217,50 @@ impl<R: Read> Reader<R> {
     }
     pub fn read_payload(&mut self, code: &Code, owner: Option<&TypeCode>) -> Result<Value> {
         self.consumed = 0;
+        self.allocated = 0;
         self.value(code, owner, 0)
+    }
+    fn allocation(&mut self, bytes: usize) -> Result<()> {
+        self.allocated = self
+            .allocated
+            .checked_add(bytes)
+            .filter(|n| *n <= self.limits.max_allocated_bytes)
+            .ok_or_else(|| Error::Limit("decoded allocation".into()))?;
+        Ok(())
+    }
+    fn array_allocation<T>(&mut self, count: usize) -> Result<()> {
+        // Include spare capacity and a temporary old buffer during Vec growth.
+        let bytes = count
+            .checked_mul(size_of::<T>())
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| Error::Limit("decoded allocation".into()))?;
+        self.allocation(bytes)
+    }
+    fn map_allocation<K, V>(&mut self, count: usize) -> Result<()> {
+        self.allocation(
+            count
+                .checked_mul(map_entry_allocation::<K, V>())
+                .ok_or_else(|| Error::Limit("decoded allocation".into()))?,
+        )
+    }
+    fn parse_code(&mut self, words: &[u16]) -> Result<Code> {
+        self.array_allocation::<Code>(words.len())?;
+        Code::from_words(words)
+    }
+    fn schema_clone(&mut self, hash: u64) -> Result<TypeCode> {
+        self.allocation(schema_allocation(self.registry.get(hash)?))?;
+        Ok(self.registry.get(hash)?.clone())
+    }
+    fn fixed_size(&mut self, code: &Code, owner: &TypeCode) -> Result<Option<usize>> {
+        let limit = self.limits.max_allocated_bytes;
+        let allocated = &mut self.allocated;
+        code.fixed_size_bounded(&self.registry, Some(owner), &mut |bytes| {
+            *allocated = allocated
+                .checked_add(bytes)
+                .filter(|n| *n <= limit)
+                .ok_or_else(|| Error::Limit("decoded allocation".into()))?;
+            Ok(())
+        })
     }
     fn depth(&self, d: usize) -> Result<()> {
         if d >= self.limits.max_depth {
@@ -164,9 +293,35 @@ impl<R: Read> Reader<R> {
         if n > self.limits.max_value_bytes.saturating_sub(self.consumed) {
             return Err(Error::Limit("value bytes".into()));
         }
-        let mut v = vec![0; n];
-        self.take_into(&mut v)?;
+        self.array_allocation::<u8>(n)?;
+        // Like C++ TypeInput::safe_read, grow only after reading a small chunk.
+        // A truncated length header must not allocate its entire declared size.
+        let mut v = Vec::new();
+        let mut chunk = [0_u8; READ_CHUNK];
+        while v.len() < n {
+            let count = (n - v.len()).min(chunk.len());
+            self.take_into(&mut chunk[..count])?;
+            let needed = v.len() + count;
+            if needed > v.capacity() {
+                let capacity = needed.max(v.capacity().saturating_mul(2)).min(n);
+                v.try_reserve_exact(capacity - v.len())
+                    .map_err(|_| Error::Limit("decoded allocation".into()))?;
+            }
+            v.extend_from_slice(&chunk[..count]);
+        }
         Ok(v)
+    }
+    fn skip(&mut self, mut n: usize) -> Result<()> {
+        if n > self.limits.max_value_bytes.saturating_sub(self.consumed) {
+            return Err(Error::Limit("value bytes".into()));
+        }
+        let mut chunk = [0_u8; READ_CHUNK];
+        while n != 0 {
+            let count = n.min(chunk.len());
+            self.take_into(&mut chunk[..count])?;
+            n -= count;
+        }
+        Ok(())
     }
     fn n(&mut self, n: usize) -> Result<u64> {
         let mut b = [0u8; 8];
@@ -194,9 +349,16 @@ impl<R: Read> Reader<R> {
         let bytes = self.raw(n)?;
         self.decode_text(bytes)
     }
-    fn decode_text(&self, bytes: Vec<u8>) -> Result<String> {
+    fn decode_text(&mut self, bytes: Vec<u8>) -> Result<String> {
         if self.utf8_lossy {
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
+            match String::from_utf8(bytes) {
+                Ok(text) => Ok(text),
+                Err(error) => {
+                    let bytes = error.into_bytes();
+                    self.array_allocation::<u8>(bytes.len().saturating_mul(3))?;
+                    Ok(String::from_utf8_lossy(&bytes).into_owned())
+                }
+            }
         } else {
             String::from_utf8(bytes).map_err(|_| invalid("invalid UTF-8"))
         }
@@ -206,7 +368,8 @@ impl<R: Read> Reader<R> {
         if n == 0 || n > 32 {
             return Err(invalid("byte code length"));
         }
-        let mut words = Vec::new();
+        self.array_allocation::<u16>(n)?;
+        let mut words = Vec::with_capacity(n);
         for _ in 0..n {
             words.push(self.n(2)? as u16);
         }
@@ -227,13 +390,14 @@ impl<R: Read> Reader<R> {
         if n == 0 || n > 32 {
             return Err(invalid("dynamic byte code length"));
         }
+        self.array_allocation::<u16>(n)?;
         let mut words = Vec::with_capacity(n);
         for _ in 0..n {
             let mut b = [0u8; 2];
             self.take_into(&mut b)?;
             words.push(u16::from_le_bytes(b));
         }
-        let code = Code::from_words(&words)?;
+        let code = self.parse_code(&words)?;
         let saved_data_order = self.data_order;
         self.data_order = ByteOrder::Little;
         let out = self.value(&code, None, depth + 1);
@@ -265,23 +429,30 @@ impl<R: Read> Reader<R> {
             };
             self.order = order;
             match c {
-                0 => return Ok(Value::Null),
+                0 => {
+                    self.allocation(size_of::<Value>())?;
+                    return Ok(Value::Null);
+                }
                 16 => continue,
                 18 => {
                     let n = self.n(4)? as usize;
-                    self.raw(n)?;
+                    self.skip(n)?;
                 }
                 14 => {
                     self.schema(depth + 1)?;
                 }
                 15 => {
                     let hash = self.n(8)?;
-                    let schema = self.registry.get(hash)?.clone();
+                    let schema = self.schema_clone(hash)?;
                     let mut value = self.record(&schema, depth + 1)?;
+                    self.map_allocation::<String, Value>(2)?;
                     if let Some(object) = value.as_object_mut() {
                         object.insert("__type".into(), schema.name.into());
                     } else {
-                        value = serde_json::json!({"__type":schema.name,"value":value});
+                        let mut object = Map::new();
+                        object.insert("__type".into(), schema.name.into());
+                        object.insert("value".into(), value);
+                        value = Value::Object(object);
                     }
                     return Ok(value);
                 }
@@ -332,7 +503,7 @@ impl<R: Read> Reader<R> {
                 }
             }
         }
-        Code::from_words(&code)?;
+        self.parse_code(&code)?;
         let data_size = if n >= 5 {
             let v = self.dynamic(depth + 1)?;
             v.as_u64().ok_or_else(|| invalid("field size"))?
@@ -369,28 +540,40 @@ impl<R: Read> Reader<R> {
         let code_hash = self.n(8)?;
         let return_type = self.n(8)?;
         let mut parents = Vec::new();
-        for _ in 0..self.count()? {
+        let count = self.count()?;
+        self.array_allocation::<u64>(count)?;
+        for _ in 0..count {
             parents.push(self.n(8)?);
         }
         let mut depends = Vec::new();
-        for _ in 0..self.count()? {
+        let count = self.count()?;
+        self.array_allocation::<u64>(count)?;
+        for _ in 0..count {
             depends.push(self.n(8)?);
         }
         let name = self.text()?;
         let mut fields = Vec::new();
-        for _ in 0..self.count()? {
+        let count = self.count()?;
+        self.array_allocation::<Field>(count)?;
+        for _ in 0..count {
             fields.push(self.field(depth + 1)?);
         }
         let mut static_fields = Vec::new();
-        for _ in 0..self.count()? {
+        let count = self.count()?;
+        self.array_allocation::<Field>(count)?;
+        for _ in 0..count {
             static_fields.push(self.field(depth + 1)?);
         }
         let mut methods = Vec::new();
-        for _ in 0..self.count()? {
+        let count = self.count()?;
+        self.array_allocation::<u64>(count)?;
+        for _ in 0..count {
             methods.push(self.n(8)?);
         }
         let mut enum_map = BTreeMap::new();
-        for _ in 0..self.count()? {
+        let count = self.count()?;
+        self.map_allocation::<u32, String>(count)?;
+        for _ in 0..count {
             let key = self.n(4)? as u32;
             let v = self.text()?;
             if enum_map.insert(key, v).is_some() {
@@ -400,7 +583,17 @@ impl<R: Read> Reader<R> {
         let mut alias_map = BTreeMap::new();
         if n >= 11 {
             let v = self.dynamic(depth + 1)?;
+            let entries = v
+                .as_array()
+                .map_or_else(|| v.as_object().map_or(0, Map::len), Vec::len);
+            self.array_allocation::<(&Value, &Value)>(entries)?;
+            self.map_allocation::<String, String>(entries)?;
             for (k, v) in map_entries(&v)? {
+                self.allocation(
+                    k.as_str()
+                        .map_or(0, str::len)
+                        .saturating_add(v.as_str().map_or(0, str::len)),
+                )?;
                 alias_map.insert(
                     k.as_str().ok_or_else(|| invalid("alias key"))?.into(),
                     v.as_str().ok_or_else(|| invalid("alias value"))?.into(),
@@ -423,10 +616,10 @@ impl<R: Read> Reader<R> {
             flags[2] = return_type != 0;
         }
         let permission = if n >= 13 {
-            self.dynamic(depth + 1)?
-                .as_str()
-                .ok_or_else(|| invalid("permission"))?
-                .into()
+            match self.dynamic(depth + 1)? {
+                Value::String(permission) => permission,
+                _ => return Err(invalid("permission")),
+            }
         } else {
             String::new()
         };
@@ -462,16 +655,17 @@ impl<R: Read> Reader<R> {
             self.registry.get(*h)?;
         }
         for fields in [&code.fields, &code.static_fields] {
+            self.map_allocation::<&String, ()>(fields.len())?;
             let mut names = BTreeSet::new();
             for f in fields {
                 if !names.insert(&f.name) {
                     return Err(invalid("duplicate schema field"));
                 }
-                let c = Code::from_words(&f.code)?;
+                let c = self.parse_code(&f.code)?;
                 validate_dependencies(&c, &code, self.limits.max_depth)?;
                 if !f.is_extended {
-                    let fixed = c
-                        .fixed_size(&self.registry, Some(&code))?
+                    let fixed = self
+                        .fixed_size(&c, &code)?
                         .ok_or_else(|| invalid("variable inline field"))?;
                     if f.data_size > 0 && f.data_size < fixed as u64 {
                         return Err(invalid("inline field size"));
@@ -484,16 +678,30 @@ impl<R: Read> Reader<R> {
         }
         for i in 0..code.fields.len() {
             if !code.fields[i].is_extended && code.fields[i].data_size == 0 {
-                code.fields[i].data_size = Code::from_words(&code.fields[i].code)?
-                    .fixed_size(&self.registry, Some(&code))?
-                    .ok_or_else(|| invalid("inline size"))?
-                    as u64;
+                let field_code = self.parse_code(&code.fields[i].code)?;
+                code.fields[i].data_size =
+                    self.fixed_size(&field_code, &code)?
+                        .ok_or_else(|| invalid("inline size"))? as u64;
             }
         }
         if self.registry.len() >= self.limits.max_schemas {
             return Err(Error::Limit("type codes".into()));
         }
+        let bytes = schema_allocation(&code);
+        self.allocation(bytes.saturating_mul(2))?;
+        let schema_bytes = if self.registry.contains_code_hash(code.code_hash) {
+            self.allocation(schema_allocation(self.registry.get(code.code_hash)?))?;
+            self.schema_bytes
+        } else {
+            let bytes = registry_allocation(&code);
+            self.allocation(bytes)?;
+            self.schema_bytes
+                .checked_add(bytes)
+                .filter(|n| *n <= self.limits.max_schema_bytes)
+                .ok_or_else(|| Error::Limit("schema allocation".into()))?
+        };
         self.registry.register(code.clone())?;
+        self.schema_bytes = schema_bytes;
         self.schema_orders.insert(code.code_hash, self.order);
         Ok(code)
     }
@@ -510,6 +718,17 @@ impl<R: Read> Reader<R> {
     }
     fn record_inner(&mut self, t: &TypeCode, depth: usize) -> Result<Value> {
         self.depth(depth)?;
+        self.allocation(size_of::<Value>())?;
+        self.map_allocation::<String, Value>(
+            t.fields.len().saturating_add(usize::from(t.is_class)),
+        )?;
+        self.allocation(
+            t.name.len().saturating_add(
+                t.fields
+                    .iter()
+                    .fold(0usize, |n, f| n.saturating_add(f.name.len())),
+            ),
+        )?;
         let mut fields = Map::new();
         if t.is_class {
             fields.insert("__type".into(), t.name.clone().into());
@@ -518,7 +737,7 @@ impl<R: Read> Reader<R> {
             for f in &t.fields {
                 if f.is_extended == ext {
                     let before = self.consumed;
-                    let code = Code::from_words(&f.code)?;
+                    let code = self.parse_code(&f.code)?;
                     let value = self.value(&code, Some(t), depth + 1)?;
                     if !ext && f.data_size > 0 {
                         let used = self.consumed - before;
@@ -527,7 +746,7 @@ impl<R: Read> Reader<R> {
                         if used > size {
                             return Err(invalid("inline field size"));
                         }
-                        self.raw(size - used)?;
+                        self.skip(size - used)?;
                     }
                     fields.insert(f.name.clone(), value);
                 }
@@ -538,10 +757,12 @@ impl<R: Read> Reader<R> {
                 .get("value")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid("enum value"))? as u32;
-            return Ok(t
-                .enum_map
-                .get(&n)
-                .map_or(Value::from(n), |s| Value::from(s.clone())));
+            return if let Some(name) = t.enum_map.get(&n) {
+                self.allocation(name.len())?;
+                Ok(Value::String(name.clone()))
+            } else {
+                Ok(Value::from(n))
+            };
         }
         Ok(Value::Object(fields))
     }
@@ -558,6 +779,7 @@ impl<R: Read> Reader<R> {
     }
     fn value_inner(&mut self, c: &Code, t: Option<&TypeCode>, depth: usize) -> Result<Value> {
         self.depth(depth)?;
+        self.allocation(size_of::<Value>())?;
         Ok(match c {
             Code::Alt(c) => return self.value(c, t, depth + 1),
             Code::Null => Value::Null,
@@ -611,6 +833,8 @@ impl<R: Read> Reader<R> {
             }
             Code::Map(k, v) => {
                 let n = self.count()?;
+                self.array_allocation::<Value>(n)?;
+                self.array_allocation::<Value>(n.saturating_mul(2))?;
                 let mut list = Vec::with_capacity(n.min(4096));
                 for _ in 0..n {
                     list.push(Value::Array(vec![
@@ -621,6 +845,7 @@ impl<R: Read> Reader<R> {
                 Value::Array(list)
             }
             Code::Tuple(parts) => {
+                self.array_allocation::<Value>(parts.len())?;
                 let mut list = Vec::with_capacity(parts.len());
                 for c in parts {
                     list.push(self.value(c, t, depth + 1)?)
@@ -631,12 +856,14 @@ impl<R: Read> Reader<R> {
                 let h = *t
                     .and_then(|t| t.depends.get(*i))
                     .ok_or_else(|| invalid("struct dependency"))?;
-                let schema = self.registry.get(h)?.clone();
+                let schema = self.schema_clone(h)?;
                 self.record(&schema, depth + 1)?
             }
             Code::Object => {
                 let mut fields = Map::new();
-                for _ in 0..self.count()? {
+                let count = self.count()?;
+                self.map_allocation::<String, Value>(count)?;
+                for _ in 0..count {
                     let key = self.text()?;
                     let value = self.dynamic(depth + 1)?;
                     if fields.insert(key, value).is_some() {
@@ -645,8 +872,15 @@ impl<R: Read> Reader<R> {
                 }
                 Value::Object(fields)
             }
-            Code::TypeCode => serde_json::to_value(self.schema(depth + 1)?)?,
+            Code::TypeCode => {
+                let schema = self.schema(depth + 1)?;
+                self.allocation(schema_json_allocation(&schema))?;
+                serde_json::to_value(schema)?
+            }
             Code::Image(d, c) => {
+                self.array_allocation::<usize>(*d)?;
+                self.array_allocation::<Value>(*d)?;
+                self.map_allocation::<String, Value>(2)?;
                 let mut dims = Vec::with_capacity(*d);
                 let mut n = 1usize;
                 for _ in 0..*d {
@@ -657,7 +891,13 @@ impl<R: Read> Reader<R> {
                         .ok_or_else(|| Error::Limit("image size".into()))?;
                     dims.push(d);
                 }
-                serde_json::json!({"size":dims,"data":self.sequence(n,c,t,depth+1)?})
+                let mut object = Map::new();
+                object.insert(
+                    "size".into(),
+                    Value::Array(dims.into_iter().map(Value::from).collect()),
+                );
+                object.insert("data".into(), self.sequence(n, c, t, depth + 1)?);
+                Value::Object(object)
             }
         })
     }
@@ -671,6 +911,7 @@ impl<R: Read> Reader<R> {
         if n > self.limits.max_container {
             return Err(Error::Limit("sequence size".into()));
         }
+        self.array_allocation::<Value>(n)?;
         let mut out = Vec::with_capacity(n.min(4096));
         for _ in 0..n {
             out.push(self.value(c, t, depth + 1)?)

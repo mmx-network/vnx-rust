@@ -82,6 +82,9 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.codes.is_empty()
     }
+    pub(crate) fn contains_code_hash(&self, hash: u64) -> bool {
+        self.codes.contains_key(&hash)
+    }
     pub fn from_json(s: &str) -> Result<Self> {
         let mut out = Self::new();
         for code in serde_json::from_str::<Vec<TypeCode>>(s)? {
