@@ -59,6 +59,11 @@ fn parse_resolve_and_generate() {
     assert!(req.is_const);
     assert_eq!(req.permission, "vnx.permission_e.READ");
     assert_eq!(req.fields[0].value, "10");
+    assert_eq!(
+        c.registry.by_name("demo.entry_t").unwrap().fields[0].value,
+        "-1",
+        "unsigned defaults retain native descriptor text"
+    );
     assert!(c.registry.by_name("demo.Node.submit").unwrap().is_async);
     let rust = generate(&c).unwrap();
     assert!(rust.contains("pub struct NodeClient"));

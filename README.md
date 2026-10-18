@@ -26,6 +26,8 @@ cargo fmt --all -- --check
 
 Schemas retain type hashes, version/code hashes, dependencies, inheritance, enums, permissions, method/return metadata and aliases. Decoders enforce configurable allocation, depth, container and schema limits. Integer conversion checks ranges and never converts oversized integer literals to floating point.
 
+Unsigned field defaults retain native descriptor text such as `-1`. Generated Rust defaults and omitted fields apply the unsigned constructor cast when creating values; explicit negative inputs still fail unsigned range checks. Preserving the descriptor prevents a preloaded registry from rejecting a native peer's otherwise identical schema.
+
 Self-describing typed output uses the canonical little-endian MMX schema ABI. Readers support alternate-endian bytecodes and independent node/field byte orders. Big-endian raw/dynamic payloads can be written, but typed big-endian output with little-endian compiler hashes is rejected: original VNX structural hashes include native-endian integer bytes, and reusing those identities corrupts C++ schema matching.
 
 For database tables, use `write_payload` / `read_payload` for bytecoded fields, `write_typed_payload` / `read_typed_payload` for externally described records, or `with_header(false).with_type_codes(false)` for class values whose registry is persisted separately. `write_type_code` / `read_type_code` support schema-only streams; registries also import/export JSON. `write_typed` selects a particular schema version by code hash.

@@ -780,11 +780,7 @@ fn default_text(f: &Field, defs: &BTreeMap<String, Definition>) -> Result<String
             return Err(invalid(format!("invalid enum default {}", f.default)));
         }
     }
-    if let Some((_, size, false)) = primitive(&f.ty.name) {
-        if crate::parser::parse_int(&f.default).is_some_and(|n| n < 0) {
-            let n = crate::parser::parse_int(&f.default).unwrap();
-            return Ok(((n as u128) & ((1_u128 << (size * 8)) - 1)).to_string());
-        }
-    }
+    // Native descriptors retain the expression's signed value, even when the
+    // field is unsigned. Cast when constructing a value, not in wire metadata.
     Ok(f.default.clone())
 }

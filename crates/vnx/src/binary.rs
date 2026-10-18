@@ -1308,8 +1308,26 @@ fn default_value(
     if depth >= 100 {
         return Err(invalid("recursive default"));
     }
+    if let Code::Alt(c) = c {
+        return default_value(c, text, r, t, depth + 1);
+    }
     if !text.is_empty() {
-        if let Ok(v) = serde_json::from_str(text) {
+        if let Ok(v) = serde_json::from_str::<Value>(text) {
+            // C++ advertises defaults such as uint/ushort = -1 verbatim.
+            // Only an omitted field gets the native unsigned constructor cast;
+            // explicit negative caller values still fail normal range checks.
+            if let Some(n) = v.as_i64().filter(|n| *n < 0) {
+                let mask = match c {
+                    Code::U8 => Some(u64::from(u8::MAX)),
+                    Code::U16 => Some(u64::from(u16::MAX)),
+                    Code::U32 => Some(u64::from(u32::MAX)),
+                    Code::U64 => Some(u64::MAX),
+                    _ => None,
+                };
+                if let Some(mask) = mask {
+                    return Ok(((n as u64) & mask).into());
+                }
+            }
             return Ok(v);
         }
         if text.starts_with('"') {
