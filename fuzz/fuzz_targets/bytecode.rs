@@ -65,8 +65,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let words: Vec<_> = data[5..end]
-        .chunks_exact(2)
-        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|word| u16::from_le_bytes(*word))
         .collect();
     let Ok(code) = heap_budget(8 * 1024 * 1024, || Code::from_words(&words)) else {
         return;
