@@ -30,6 +30,8 @@ Readers follow C++ `TypeInput::safe_read`: strings and byte lists grow only as i
 
 `Limits::max_depth` defaults to 100, matching C++ `VNX_MAX_RECURSION`. Nested values, dynamic headers, objects, records and schema definitions share the depth budget. The counter follows decoder operations, so it is conservative rather than an exact count of JSON nesting levels. Bytecode parsing and inline-layout sizing also have independent fixed 100-step recursion caps; cached layouts cannot bypass the cap.
 
+[Serialization fuzzing](fuzz/README.md) provides two coverage-guided targets with AddressSanitizer, independent checks on actual heap requests, and seeds for compact allocation expansion, recursion boundaries and schema graphs. GitHub Actions runs short campaigns on changes and longer weekly or manual campaigns. The fuzzing dependencies live in a separate workspace.
+
 Unsigned field defaults retain native descriptor text such as `-1`. Generated Rust defaults and omitted fields apply the unsigned constructor cast when creating values; explicit negative inputs still fail unsigned range checks. Preserving the descriptor prevents a preloaded registry from rejecting a native peer's otherwise identical schema.
 
 Self-describing typed output uses the canonical little-endian MMX schema ABI. Readers support alternate-endian bytecodes and independent node/field byte orders. Big-endian raw/dynamic payloads can be written, but typed big-endian output with little-endian compiler hashes is rejected: original VNX structural hashes include native-endian integer bytes, and reusing those identities corrupts C++ schema matching.

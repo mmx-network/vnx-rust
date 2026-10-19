@@ -1,0 +1,87 @@
+name: Serialization fuzzing
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '31 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Fuzzing seconds per target (1 to 3600)
+        required: false
+        default: '300'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [decode, bytecode]
+    env:
+      DEBUGINFOD_URLS: ''
+      FUZZ_TARGET: ${{ matrix.target }}
+      FUZZ_SECONDS: ${{ inputs.seconds || (github.event_name == 'schedule' && '300') || '20' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          key: fuzz-${{ matrix.target }}
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Check locked fuzz dependencies
+        run: cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
+      - name: Check fuzz harness formatting
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+      - name: Lint fuzz harness
+        run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Restore coverage corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-
+      - name: Prepare writable corpus
+        run: |
+          mkdir -p "fuzz/corpus/$FUZZ_TARGET"
+          cp "fuzz/seeds/$FUZZ_TARGET/"* "fuzz/corpus/$FUZZ_TARGET/"
+      - name: Fuzz with address sanitizer and resource guards
+        run: |
+          if [[ ! "$FUZZ_SECONDS" =~ ^[1-9][0-9]{0,3}$ ]] || (( FUZZ_SECONDS > 3600 )); then
+            echo 'seconds must be an integer from 1 to 3600' >&2
+            exit 2
+          fi
+          cargo fuzz run "$FUZZ_TARGET" "fuzz/corpus/$FUZZ_TARGET" -- \
+            -max_total_time="$FUZZ_SECONDS" \
+            -timeout=5 \
+            -rss_limit_mb=512 \
+            -malloc_limit_mb=128 \
+            -max_len=65536 \
+            -print_funcs=0 \
+            -print_final_stats=1
+      - name: Verify fuzz lockfile stayed unchanged
+        run: git diff --exit-code -- fuzz/Cargo.lock
+      - name: Save failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 14
