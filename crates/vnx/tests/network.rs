@@ -118,6 +118,50 @@ fn exercise(endpoint: Endpoint) -> Result<()> {
 fn tcp_vnx_streaming_ids_errors_samples_and_shutdown() -> Result<()> {
     exercise("tcp://127.0.0.1:0".parse()?)
 }
+#[test]
+fn server_receive_limits_reject_large_public_samples_before_queueing() -> Result<()> {
+    let runtime = runtime()?;
+    let sub = runtime.subscribe("test", 4, OverflowPolicy::Reject, false)?;
+    let mut server = Server::bind(
+        "tcp://127.0.0.1:0".parse()?,
+        runtime.clone(),
+        registry()?,
+        ServerOptions {
+            services: ["echo".into()].into(),
+            session: Session::new("peer", ["echo".into(), "vnx.permission_e.PUBLISH".into()]),
+            publish_topics: ["test".into()].into(),
+            receive_limits: vnx::binary::Limits {
+                max_string_bytes: 1024,
+                max_value_bytes: 8192,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )?;
+    let client = NetworkClient::connect(
+        server.endpoint(),
+        "echo",
+        registry()?,
+        Duration::from_secs(1),
+    )?;
+    assert_eq!(
+        client.call_value("example.Echo.call", json!({"value":"small"}))?["_ret_0"],
+        "echo:small"
+    );
+    client.publish(
+        "test",
+        json!({"__type":"vnx.Exception","what":"x".repeat(4096)}),
+    )?;
+    // A subsequent request observes the closed stream. No decoded large value
+    // ever reaches the runtime's otherwise item-bounded subscription queue.
+    assert!(client
+        .call_value("example.Echo.call", json!({"value":"after"}))
+        .is_err());
+    assert!(sub.try_recv()?.is_none());
+    server.shutdown();
+    runtime.shutdown();
+    Ok(())
+}
 #[cfg(unix)]
 #[test]
 fn unix_vnx_streaming_and_socket_cleanup() -> Result<()> {

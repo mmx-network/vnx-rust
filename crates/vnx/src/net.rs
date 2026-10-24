@@ -795,6 +795,9 @@ pub struct ServerOptions {
     pub session: Session,
     pub request_timeout: Duration,
     pub max_connections: usize,
+    /// Per-message decoding and connection-local schema budgets. Applications
+    /// exposing a narrow protocol can set smaller limits than the VNX defaults.
+    pub receive_limits: crate::binary::Limits,
     /// Shared advertised process identity (0 chooses a cryptographic identity at bind).
     pub process_id: u64,
     pub heartbeat_interval: Duration,
@@ -814,6 +817,7 @@ impl Default for ServerOptions {
             session: Session::anonymous(),
             request_timeout: Duration::from_secs(30),
             max_connections: 64,
+            receive_limits: crate::binary::Limits::default(),
             process_id: 0,
             heartbeat_interval: Duration::from_secs(10),
             publish_topics: BTreeSet::new(),
@@ -1109,7 +1113,8 @@ fn serve_connection(
     options: ServerOptions,
 ) -> Result<()> {
     stream.set_write_timeout(options.request_timeout)?;
-    let mut input = crate::binary::Reader::new(stream.try_clone()?, registry.clone());
+    let mut input = crate::binary::Reader::new(stream.try_clone()?, registry.clone())
+        .with_limits(options.receive_limits.clone());
     let writer = Arc::new(Mutex::new(crate::binary::Writer::new(stream, registry)));
     let session = Arc::new(RwLock::new(options.session.clone()));
     let mut session_lease = SessionLease {
